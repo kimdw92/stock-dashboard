@@ -213,6 +213,32 @@ def _slope_color(val: object) -> str:
     return "background-color: #e74c3c; color: #ffffff"
 
 
+def _pct_color(val: object, cap: float) -> str:
+    """등락률(%) 값을 부호·크기에 따라 초록/빨강 그라데이션으로 강조. cap(해당 컬럼 내 최대 절대값) 이상은 최대 채도."""
+    try:
+        v = float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if pd.isna(v) or v == 0 or not cap:
+        return ""
+
+    intensity = min(abs(v) / cap, 1.0)
+    if v > 0:
+        base = (46, 204, 113)   # 초록
+        text = "#000000"
+    else:
+        base = (231, 76, 60)    # 빨강
+        text = "#000000" if intensity < 0.5 else "#ffffff"
+    r, g, b = (int(255 + (c - 255) * intensity) for c in base)
+    return f"background-color: rgb({r},{g},{b}); color: {text}"
+
+
+def _pct_color_column(col: pd.Series) -> list[str]:
+    """컬럼별 최대 절대값을 기준으로 독립적인 색상 범위를 적용."""
+    cap = col.abs().max()
+    return [_pct_color(v, cap) for v in col]
+
+
 def _make_treemap(
     df: pd.DataFrame,
     label_col: str,
@@ -335,7 +361,7 @@ def _make_trend_chart(
     return fig
 
 
-def _render_ranking_table(df: pd.DataFrame, height: int = 500) -> None:
+def _render_ranking_table(df: pd.DataFrame, height: int = 500, exclude_cols: list[str] | None = None) -> None:
     """rs_slope 색상 강조 + column_config가 적용된 순위표."""
     candidate_cols = [
         "rs_rank", "ticker", "sector_name", "theme", "rs_score", "rs_slope",
@@ -343,6 +369,8 @@ def _render_ranking_table(df: pd.DataFrame, height: int = 500) -> None:
         "price_chg_1m_pct", "price_chg_3m_pct", "price_chg_6m_pct", "price_chg_1y_pct",
         "rs_1m", "rs_3m", "rs_line_phase",
     ]
+    if exclude_cols:
+        candidate_cols = [c for c in candidate_cols if c not in exclude_cols]
     display_cols = [c for c in candidate_cols if c in df.columns]
     display_df = df[display_cols].sort_values("rs_rank").reset_index(drop=True)
 
@@ -361,8 +389,21 @@ def _render_ranking_table(df: pd.DataFrame, height: int = 500) -> None:
         "rs_line_phase": st.column_config.TextColumn("RS Phase"),
     }
 
+    pct_cols = [
+        c for c in (
+            "price_chg_pct", "price_chg_5d_pct",
+            "price_chg_1m_pct", "price_chg_3m_pct", "price_chg_6m_pct", "price_chg_1y_pct",
+        )
+        if c in display_df.columns
+    ]
+
+    styled = display_df.style
     if "rs_slope" in display_df.columns:
-        styled = display_df.style.map(_slope_color, subset=["rs_slope"])
+        styled = styled.map(_slope_color, subset=["rs_slope"])
+    if pct_cols:
+        styled = styled.apply(_pct_color_column, subset=pct_cols, axis=0)  # type: ignore[arg-type]
+
+    if "rs_slope" in display_df.columns or pct_cols:
         st.dataframe(styled, use_container_width=True, hide_index=True, column_config=col_config, height=height)
     else:
         st.dataframe(display_df, use_container_width=True, hide_index=True, column_config=col_config, height=height)
@@ -1164,52 +1205,48 @@ def _show_sector_tab(sector_summary: pd.DataFrame, rs_full: pd.DataFrame) -> Non
     df = df.sort_values("rs_score", ascending=False).reset_index(drop=True)
     df["rs_rank"] = range(1, len(df) + 1)
 
-    # 섹션 A: 섹터 히트맵
+    # 섹션 A: 섹터 RS 순위표
     with st.container():
-        st.markdown("#### 섹터 RS 히트맵")
-        fig_treemap = _make_treemap(df, "sector_name", "ticker", "섹터 RS")
-        st.plotly_chart(fig_treemap, use_container_width=True, key="sector_treemap")
+        st.markdown("#### 섹터 RS 순위표")
+        _render_ranking_table(
+            df, height=550,
+            exclude_cols=["rs_score", "rs_slope", "rs_1m", "rs_3m", "rs_line_phase"],
+        )
 
-    # 섹션 B: 순위표 + RS Line 추이
+    # 섹션 B: RS Line 추이
     with st.container():
-        st.markdown("#### 섹터 RS 순위표 & RS Line 추이")
-        col1, col2 = st.columns([4, 6])
+        st.markdown("#### 섹터 RS Line 추이")
+        ctrl_left, ctrl_right = st.columns([6, 4])
+        with ctrl_left:
+            default_tickers = df.sort_values("rs_rank").head(3)["ticker"].tolist()
+            chosen = st.multiselect(
+                "표시할 섹터 선택",
+                options=df["ticker"].tolist(),
+                default=default_tickers,
+                key="sector_multiselect",
+            )
+        with ctrl_right:
+            period_options = {"1개월": 1, "3개월": 3, "6개월": 6, "12개월": 12}
+            period_label = st.radio(
+                "기간",
+                options=list(period_options.keys()),
+                index=2,
+                horizontal=True,
+                key="sector_chart_period",
+            )
+        selected_months = period_options[period_label]
 
-        with col1:
-            _render_ranking_table(df, height=550)
-
-        with col2:
-            ctrl_left, ctrl_right = st.columns([6, 4])
-            with ctrl_left:
-                default_tickers = df.sort_values("rs_rank").head(3)["ticker"].tolist()
-                chosen = st.multiselect(
-                    "표시할 섹터 선택",
-                    options=df["ticker"].tolist(),
-                    default=default_tickers,
-                    key="sector_multiselect",
-                )
-            with ctrl_right:
-                period_options = {"1개월": 1, "3개월": 3, "6개월": 6, "12개월": 12}
-                period_label = st.radio(
-                    "기간",
-                    options=list(period_options.keys()),
-                    index=2,
-                    horizontal=True,
-                    key="sector_chart_period",
-                )
-            selected_months = period_options[period_label]
-
-            if chosen:
-                fig_line = _make_trend_chart(
-                    rs_full, chosen,
-                    f"섹터 RS Line 추이 (최근 {period_label}, 정규화)",
-                    months=selected_months,
-                    normalize=True,
-                )
-                if fig_line:
-                    st.plotly_chart(fig_line, use_container_width=True)
-                else:
-                    st.info("RS Line 데이터가 없습니다.")
+        if chosen:
+            fig_line = _make_trend_chart(
+                rs_full, chosen,
+                f"섹터 RS Line 추이 (최근 {period_label}, 정규화)",
+                months=selected_months,
+                normalize=True,
+            )
+            if fig_line:
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.info("RS Line 데이터가 없습니다.")
 
 
 # ─── Tab 1.5: 산업 분석 ───────────────────────────────────────────────────────
@@ -1239,6 +1276,7 @@ def _build_industry_summary(
         return pd.DataFrame()
 
     df = screener.copy()
+    df = df[df["industry"].notna()]
     df["industry"] = df["industry"].astype(str).str.strip()
     df = df[df["industry"] != ""]
     df = df[df["industry"].str.lower() != "nan"]
@@ -1546,56 +1584,51 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
         else theme_summary.copy()
     )
 
-    # 섹션 C: 테마 ETF 히트맵
+    # 섹션 C: 테마 ETF RS 순위표
     with st.container():
-        st.markdown("#### 테마 ETF RS 히트맵")
-        fig_theme_map = _make_treemap(df, "ticker", "ticker", "테마 ETF RS")
-        st.plotly_chart(fig_theme_map, use_container_width=True, key="theme_treemap")
+        st.markdown("#### 테마 ETF RS 순위표")
+        _render_ranking_table(
+            df, height=550,
+            exclude_cols=["rs_score", "rs_slope", "rs_1m", "rs_3m", "rs_line_phase"],
+        )
 
-    # 섹션 D: 순위표 + RS Line 추이
+    # 섹션 D: RS Line 추이
     with st.container():
-        st.markdown("#### 테마 ETF RS 순위표 & RS Line 추이")
-        col1, col2 = st.columns([4, 6])
-
-        with col1:
-            _render_ranking_table(df, height=550)
-
-        with col2:
-            theme_tickers = df["ticker"].unique().tolist()
-            default_t = (
-                df.sort_values("rs_rank").head(3)["ticker"].tolist()
-                if "rs_rank" in df.columns
-                else theme_tickers[:3]
-            )
+        st.markdown("#### 테마 ETF RS Line 추이")
+        theme_tickers = df["ticker"].unique().tolist()
+        default_t = (
+            df.sort_values("rs_rank").head(3)["ticker"].tolist()
+            if "rs_rank" in df.columns
+            else theme_tickers[:3]
+        )
+        ctrl_left, ctrl_right = st.columns([6, 4])
+        with ctrl_left:
             chosen_themes = st.multiselect(
                 "표시할 테마 ETF 선택",
                 options=theme_tickers,
                 default=default_t,
                 key="theme_multiselect",
             )
-            ctrl_left, ctrl_right = st.columns([6, 4])
-            with ctrl_left:
-                pass
-            with ctrl_right:
-                period_options = {"1개월": 1, "3개월": 3, "6개월": 6, "12개월": 12}
-                period_label = st.radio(
-                    "기간",
-                    options=list(period_options.keys()),
-                    index=2,
-                    horizontal=True,
-                    key="theme_chart_period",
-                )
-            if chosen_themes:
-                fig_theme_line = _make_trend_chart(
-                    rs_full, chosen_themes,
-                    f"테마 ETF RS Line 추이 (최근 {period_label}, 정규화)",
-                    months=period_options[period_label],
-                    normalize=True,
-                )
-                if fig_theme_line:
-                    st.plotly_chart(fig_theme_line, use_container_width=True)
-                else:
-                    st.info("RS Line 데이터가 없습니다.")
+        with ctrl_right:
+            period_options = {"1개월": 1, "3개월": 3, "6개월": 6, "12개월": 12}
+            period_label = st.radio(
+                "기간",
+                options=list(period_options.keys()),
+                index=2,
+                horizontal=True,
+                key="theme_chart_period",
+            )
+        if chosen_themes:
+            fig_theme_line = _make_trend_chart(
+                rs_full, chosen_themes,
+                f"테마 ETF RS Line 추이 (최근 {period_label}, 정규화)",
+                months=period_options[period_label],
+                normalize=True,
+            )
+            if fig_theme_line:
+                st.plotly_chart(fig_theme_line, use_container_width=True)
+            else:
+                st.info("RS Line 데이터가 없습니다.")
 
 
 # ─── Tab 3: 종목 스크리너 ─────────────────────────────────────────────────────

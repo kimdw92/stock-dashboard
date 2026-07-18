@@ -143,16 +143,120 @@ def fetch_filtered_universe() -> pd.DataFrame:
         print("[Warning] No universe files found. Falling back to default tickers.")
         return pd.DataFrame({"Ticker": ["AAPL", "MSFT", "GOOGL", "NVDA"], "Exchange": ["NASDAQ"]*4})
 
-def fetch_sector_industry_map(tickers: list[str]) -> dict[str, dict[str, str]]:
+def _fetch_single_sector_industry(ticker: str) -> tuple[str, dict[str, str] | None]:
+    """단일 티커의 sector/industry를 yfinance에서 조회한다. 실패 시 None."""
+    try:
+        time.sleep(random.uniform(0.1, 0.3))  # 디도스 방어 우회용 미세 지연
+        info = yf.Ticker(ticker).info
+        if not info:
+            return ticker, None
+        sector = info.get("sector") or ""
+        industry = info.get("industry") or ""
+        if not sector and not industry:
+            return ticker, None
+        return ticker, {"sector": str(sector), "industry": str(industry)}
+    except Exception:
+        return ticker, None
+
+
+def _fetch_sector_industry_batch(tickers: list[str]) -> dict[str, dict[str, str] | None]:
+    """주어진 티커들의 sector/industry를 멀티스레드로 수집해 dict로 반환한다."""
+    result: dict[str, dict[str, str] | None] = {}
+    total = len(tickers)
+    max_workers = 5  # 안정적인 크롤링을 위해 스레드 제한
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ticker = {executor.submit(_fetch_single_sector_industry, t): t for t in tickers}
+        for idx, future in enumerate(as_completed(future_to_ticker), start=1):
+            ticker, info = future.result()
+            result[ticker] = info
+            if idx % 200 == 0 or idx == total:
+                print(f"  [Sector] 진행률: {idx}/{total} 완료...")
+    return result
+
+
+def fetch_sector_industry_map(
+    tickers: list[str],
+    force_update: bool = False,
+    max_age_days: int = 90,
+) -> dict[str, dict[str, str]]:
+    """
+    모든 종목의 sector/industry 메타데이터를 yfinance에서 수집해 로컬 캐시에 저장한다.
+
+    야후 파이낸스 차단을 피하기 위해 전체 재수집은 피하되, 다음 두 경우는 증분 수집한다:
+      1) 캐시에 없는 신규 티커 (유니버스 편입 종목)
+      2) 마지막 갱신일이 max_age_days를 초과한 오래된 티커
+    force_update=True면 전체를 강제 재수집한다.
+
+    반환: {ticker: {"sector": str, "industry": str}} (요청 티커에 한정)
+    """
     cache_path = Path(__file__).parent / ".cache" / "sector_industry_map.json"
+    cache_path.parent.mkdir(exist_ok=True, parents=True)
+
+    today_str = pd.Timestamp.now().normalize().date().isoformat()
+
+    # 1. 기존 캐시 로드 (각 항목: {"sector", "industry", "updated_at"})
+    cache: dict[str, dict[str, str]] = {}
     if cache_path.exists():
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data
+                cache = json.load(f)
+            print(f"  [Sector] sector/industry 캐시 로드 ({len(cache):,}개 종목)")
         except Exception as e:
-            print(f"[Warning] Failed to load sector_industry_map: {e}")
-    return {}
+            print(f"  [Warning] sector/industry 캐시 로드 실패, 새로 수집합니다: {e}")
+            cache = {}
+
+    # 2. 수집 대상 선정
+    unique_tickers = list(dict.fromkeys(tickers))  # 순서 유지 + 중복 제거
+    if force_update:
+        to_fetch = unique_tickers
+        print(f"  [Sector] force_update=True → 전체 {len(to_fetch):,}개 종목 재수집")
+    else:
+        stale_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=max_age_days)
+        to_fetch = []
+        for t in unique_tickers:
+            entry = cache.get(t)
+            if entry is None:
+                to_fetch.append(t)                       # (1) 신규 티커
+            else:
+                updated = pd.to_datetime(entry.get("updated_at"), errors="coerce")
+                if pd.isna(updated) or updated < stale_cutoff:
+                    to_fetch.append(t)                   # (2) 오래된 티커
+        if to_fetch:
+            reused = len(unique_tickers) - len(to_fetch)
+            print(f"  [Sector] 증분 수집 대상 {len(to_fetch):,}개 "
+                  f"(신규/{max_age_days}일 초과), 캐시 재사용 {reused:,}개")
+        else:
+            print(f"  [Sector] 갱신 대상 없음 → 캐시 그대로 사용 ({len(cache):,}개)")
+
+    # 3. 증분 수집 실행 및 캐시 병합
+    if to_fetch:
+        fetched = _fetch_sector_industry_batch(to_fetch)
+        for t, info in fetched.items():
+            # 이번 수집에서 실패(None)했지만 기존 캐시에 유효값이 있으면 캐시를 보존한다.
+            if info is None:
+                if t in cache and (cache[t].get("sector") or cache[t].get("industry")):
+                    continue
+                cache[t] = {"sector": "", "industry": "", "updated_at": today_str}
+            else:
+                cache[t] = {**info, "updated_at": today_str}
+
+        # 저장 (원자적 쓰기)
+        try:
+            tmp_path = cache_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+            tmp_path.replace(cache_path)
+            print(f"  [Sector] 마스터 캐시 저장 완료 -> {cache_path} ({len(cache):,}개)")
+        except Exception as e:
+            print(f"  [Warning] sector/industry 캐시 저장 실패: {e}")
+
+    # 4. 요청 티커에 해당하는 sector/industry만 반환 (내부 메타데이터 updated_at 제외)
+    result: dict[str, dict[str, str]] = {}
+    for t in unique_tickers:
+        entry = cache.get(t)
+        if entry and (entry.get("sector") or entry.get("industry")):
+            result[t] = {"sector": entry.get("sector", ""), "industry": entry.get("industry", "")}
+    return result
 
 def _extract_field(raw: pd.DataFrame, field: str, chunk: list[str]) -> pd.DataFrame:
     if raw.empty:
@@ -563,7 +667,7 @@ def _records_from_holdings_table(
                 "Rank": len(records) + 1,
                 "Source": source,
                 "SourceStatus": status,
-                "AsOfDate": pd.Timestamp.utcnow().normalize().date().isoformat(),
+                "AsOfDate": pd.Timestamp.now("UTC").normalize().date().isoformat(),
                 "ScreenableTicker": _screenable_ticker(holding_ticker),
             }
         )
