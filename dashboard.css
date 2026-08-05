@@ -1,0 +1,103 @@
+/* ─── Performance Table 컴포넌트 ────────────────────────────────────────────
+   app.py의 render_performance_table()이 생성하는 HTML에 대응하는 스타일.
+   Python 코드에는 스타일 문자열을 두지 않는다 — 단, 값에 따라 달라지는
+   조건부 서식(데이터 바 / 그라데이션 배경)만 인라인 style로 주입된다.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* 카드 */
+.pf-card {
+  background: #ffffff;
+  border: 1px solid #dfe3e8;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.08);
+  padding: 12px;
+  margin-bottom: 18px;
+  overflow: hidden;
+}
+
+/* 섹션 헤더 (Navy) */
+.pf-title {
+  background: #23476B;
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 14px;
+  text-align: center;
+  height: 36px;
+  line-height: 36px;
+  border-radius: 4px;
+  margin-bottom: 10px;
+  letter-spacing: 0.2px;
+}
+
+/* 좁은 화면에서 표만 가로 스크롤 — 페이지 레이아웃은 깨지지 않는다 */
+.pf-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.pf-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  /* 컬럼 너비 자동 조절 */
+  table-layout: auto;
+  min-width: 460px;
+}
+
+/* 컬럼 헤더 */
+.pf-table th {
+  background: #eef1f4;
+  color: #23476B;
+  font-weight: 700;
+  text-align: center;
+  padding: 6px 10px;
+  border: 1px solid #e3e6ea;
+  white-space: nowrap;
+}
+
+/* 본문 셀 — zebra striping 없음, 연회색 그리드라인 */
+.pf-table td {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #edeff2;
+  color: #1f2328;
+  background-clip: padding-box;   /* 배경 그라데이션이 테두리를 덮지 않게 */
+}
+
+.pf-table tbody tr:hover td {
+  outline: 1px solid #c8d3de;
+  outline-offset: -1px;
+}
+
+/* 정렬 */
+.pf-cat {
+  text-align: left;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+/* 이름 뒤에 붙는 티커 ("Consumer Discretionary: XLY")
+   — 콜론까지 이 span 안에 들어 있어 스타일이 없어도 표기가 깨지지 않는다 */
+.pf-tkr {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7a8c;
+}
+
+.pf-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 값 없음 */
+.pf-na {
+  color: #98a2b3;
+}
+
+/* 다크 테마에서도 카드가 흰색 기반이므로 글자색을 고정한다 */
+@media (prefers-color-scheme: dark) {
+  .pf-card { background: #ffffff; }
+  .pf-table td { color: #1f2328; }
+}

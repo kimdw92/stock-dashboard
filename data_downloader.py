@@ -16,6 +16,7 @@ from pathlib import Path
 import pandas as pd
 
 from data_loader import (
+    UNIVERSE_MIN_DOLLAR_VOLUME,
     calculate_market_caps_from_ohlcv,
     download_ohlcv,
     download_spy_close,
@@ -54,7 +55,10 @@ CURATED_ETFS = [
  
     # ── Market Benchmark ──────────────────────────────────────────────────────
     {"Ticker": "SPY",  "Name": "SPDR S&P 500 ETF Trust",                          "Category": "Market",        "Theme": "S&P 500",                 "Provider": "SPDR",       "HoldingsUrl": _spdr_holdings_url("SPY")},
+    {"Ticker": "RSP",  "Name": "Invesco S&P 500 Equal Weight ETF",                "Category": "Market",        "Theme": "S&P 500 Equal Weight",    "Provider": "Invesco",    "HoldingsUrl": ""},
     {"Ticker": "QQQ",  "Name": "Invesco QQQ Trust",                               "Category": "Market",        "Theme": "Nasdaq 100",              "Provider": "Invesco",    "HoldingsUrl": ""},
+    {"Ticker": "QQQE", "Name": "Direxion NASDAQ-100 Equal Weighted Index ETF",    "Category": "Market",        "Theme": "Nasdaq 100 Equal Weight", "Provider": "Direxion",   "HoldingsUrl": ""},
+    {"Ticker": "MDY",  "Name": "SPDR S&P MidCap 400 ETF Trust",                   "Category": "Market",        "Theme": "Mid Caps",                "Provider": "SPDR",       "HoldingsUrl": ""},
     {"Ticker": "IWM",  "Name": "iShares Russell 2000 ETF",                        "Category": "Market",        "Theme": "Small Caps",              "Provider": "iShares",    "HoldingsUrl": ""},
  
     # ── Industry (SPDR S&P 서브인더스트리) ────────────────────────────────────
@@ -133,17 +137,26 @@ CURATED_ETFS = [
 ]
 
 def _save_intermediate(df: pd.DataFrame, name: str) -> None:
-    """중간 파일을 .intermediate 디렉토리에 저장합니다."""
+    """중간 파일을 .intermediate 디렉토리에 저장합니다.
+
+    빈 결과(레이트리밋 등 수집 실패)가 기존 정상 파일을 덮어쓰지 않도록 보호한다.
+    """
     INTERMEDIATE_DIR.mkdir(exist_ok=True)
     path = INTERMEDIATE_DIR / f"{name}.parquet"
+    if df.empty and path.exists():
+        print(f"  [Save-Skip] {name}: 새 데이터가 비어 있어 기존 파일을 보존합니다.")
+        return
     df.to_parquet(path, index=True)
     print(f"  [Save] {name} -> {path} ({len(df)}행)")
 
 
 def _save_series(series: pd.Series, name: str) -> None:
-    """시리즈를 중간 파일로 저장합니다."""
+    """시리즈를 중간 파일로 저장합니다. (빈 결과는 기존 파일 보존)"""
     INTERMEDIATE_DIR.mkdir(exist_ok=True)
     path = INTERMEDIATE_DIR / f"{name}.parquet"
+    if series.empty and path.exists():
+        print(f"  [Save-Skip] {name}: 새 데이터가 비어 있어 기존 파일을 보존합니다.")
+        return
     df = series.to_frame(name=name)
     df.to_parquet(path, index=True)
     print(f"  [Save] {name} -> {path} ({len(df)}행)")
@@ -173,7 +186,10 @@ def run_download() -> None:
     # [Step 3] OHLCV 시계열 데이터 다운로드
     yf_tickers = [normalize_ticker(t) for t in universe["Ticker"]]
     print(f"[Step 3/7] OHLCV 다운로드 ({len(yf_tickers):,}개 종목, period={DOWNLOAD_PERIOD})...")
-    close_df, high_df, low_df, volume_df = download_ohlcv(yf_tickers, period=DOWNLOAD_PERIOD)
+    close_df, high_df, low_df, volume_df = download_ohlcv(
+        yf_tickers, period=DOWNLOAD_PERIOD,
+        min_dollar_volume=UNIVERSE_MIN_DOLLAR_VOLUME,
+    )
     _save_intermediate(close_df, "close")
     _save_intermediate(high_df, "high")
     _save_intermediate(low_df, "low")
@@ -203,13 +219,30 @@ def run_download() -> None:
     # [Step 6] ETF 상위 보유종목 다운로드
     print(f"[Step 6/7] ETF 상위 보유종목 다운로드 (top {ETF_TOP_HOLDINGS_LIMIT})...")
     etf_top_holdings = fetch_etf_top_holdings(etf_info, limit=ETF_TOP_HOLDINGS_LIMIT)
+    # 레이트리밋 등으로 일부 ETF 수집이 실패해도 이전 파일의 해당 ETF 행을 보존해,
+    # 부분 실패가 기존 정상 데이터를 지우지 않게 한다 (보유종목은 천천히 변하므로 안전).
+    prev_path = INTERMEDIATE_DIR / "etf_top_holdings.parquet"
+    if prev_path.exists() and not etf_top_holdings.empty:
+        try:
+            prev = pd.read_parquet(prev_path)
+            fetched_ok = set(etf_top_holdings["ETF"].unique())
+            keep = prev[~prev["ETF"].isin(fetched_ok)]
+            if not keep.empty:
+                etf_top_holdings = pd.concat([etf_top_holdings, keep], ignore_index=True)
+                print(f"  [ETF Holdings] 이번 수집 실패 {keep['ETF'].nunique()}개 ETF는 "
+                      f"이전 데이터 보존 ({len(keep)}행)")
+        except Exception as e:
+            print(f"  [Warning] 이전 ETF 보유종목 병합 실패: {e}")
     _save_intermediate(etf_top_holdings, "etf_top_holdings")
 
     # [Step 7] 시가총액 데이터 수집 및 우회 계산 (수정된 핵심 파트)
     print(f"[Step 7/7] 발행 주식 수 확인 및 시가총액 우회 계산 중...")
     
     # 1. 발행 주식 수 마스터 로드 (최초 1회만 API 호출, 이후엔 0초만에 캐시 로드)
-    shares_outstanding = fetch_shares_outstanding(yf_tickers, force_update=False)
+    #    유동성 하한에 걸린 휴면 티커는 close_df에서 이미 빠졌다. 시가총액을 낼 대상이
+    #    아니므로 여기서도 제외해, 실행당 메타데이터 상한을 활성 종목에만 쓴다.
+    active_tickers = [t for t in yf_tickers if t in close_df.columns]
+    shares_outstanding = fetch_shares_outstanding(active_tickers, force_update=False)
     
     # 2. 다운로드된 종가(close_df)와 주식 수를 곱해 시가총액 자체 연산
     market_caps = calculate_market_caps_from_ohlcv(close_df, shares_outstanding)

@@ -13,6 +13,6 @@
   "screener_mktcap_min": 2.0,
   "screener_atr_pct_min": 3.0,
   "screener_atr_multiple_max": 7.0,
-  "screener_ind_rank_max": 30,
+  "screener_ind_rank_max": 40,
   "screener_sort_by": "RS Percentile"
 }
