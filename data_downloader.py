@@ -29,6 +29,10 @@ from data_loader import (
 
 DOWNLOAD_PERIOD = "16mo"
 ETF_TOP_HOLDINGS_LIMIT = 10
+# ETF 보유종목 재수집 주기(일). 캐시가 이 일수 이내로 신선하면 재수집을 건너뛴다.
+# 지수형 ETF는 분기 리밸런싱이라 30일이면 충분히 신선하며, 매 실행 전체 재수집이
+# 소모하던 요청 예산(특히 yfinance=야후 레이트리밋)과 시간을 절약한다.
+ETF_HOLDINGS_MAX_AGE_DAYS = 30
 INTERMEDIATE_DIR = Path(__file__).parent / ".intermediate"
 
 
@@ -60,6 +64,7 @@ CURATED_ETFS = [
     {"Ticker": "QQQE", "Name": "Direxion NASDAQ-100 Equal Weighted Index ETF",    "Category": "Market",        "Theme": "Nasdaq 100 Equal Weight", "Provider": "Direxion",   "HoldingsUrl": ""},
     {"Ticker": "MDY",  "Name": "SPDR S&P MidCap 400 ETF Trust",                   "Category": "Market",        "Theme": "Mid Caps",                "Provider": "SPDR",       "HoldingsUrl": ""},
     {"Ticker": "IWM",  "Name": "iShares Russell 2000 ETF",                        "Category": "Market",        "Theme": "Small Caps",              "Provider": "iShares",    "HoldingsUrl": ""},
+    {"Ticker": "MAGS", "Name": "Roundhill Magnificent Seven ETF",                 "Category": "Market",        "Theme": "Magnificent Seven",       "Provider": "Roundhill",  "HoldingsUrl": ""},
  
     # ── Industry (SPDR S&P 서브인더스트리) ────────────────────────────────────
     {"Ticker": "XBI",  "Name": "SPDR S&P Biotech ETF",                            "Category": "Industry",      "Theme": "Biotech",                 "Provider": "SPDR",       "HoldingsUrl": _spdr_holdings_url("XBI")},
@@ -70,6 +75,7 @@ CURATED_ETFS = [
     {"Ticker": "KBE",  "Name": "SPDR S&P Bank ETF",                               "Category": "Industry",      "Theme": "Banks",                   "Provider": "SPDR",       "HoldingsUrl": _spdr_holdings_url("KBE")},
     {"Ticker": "KRE",  "Name": "SPDR S&P Regional Banking ETF",                   "Category": "Industry",      "Theme": "Regional Banks",          "Provider": "SPDR",       "HoldingsUrl": _spdr_holdings_url("KRE")},
     {"Ticker": "KIE",  "Name": "SPDR S&P Insurance ETF",                          "Category": "Industry",      "Theme": "Insurance",               "Provider": "SPDR",       "HoldingsUrl": _spdr_holdings_url("KIE")},
+    {"Ticker": "IYT",  "Name": "iShares U.S. Transportation ETF",                 "Category": "Industry",      "Theme": "Transportation",          "Provider": "iShares",    "HoldingsUrl": ""},
     {"Ticker": "KOMP", "Name": "SPDR S&P Kensho New Economies Composite ETF",     "Category": "Theme",         "Theme": "New Economies",           "Provider": "SPDR",       "HoldingsUrl": _spdr_holdings_url("KOMP")},
  
     # ── Semiconductors ────────────────────────────────────────────────────────
@@ -81,6 +87,9 @@ CURATED_ETFS = [
     {"Ticker": "AIQ",  "Name": "Global X Artificial Intelligence & Technology ETF","Category": "Theme",        "Theme": "AI & Technology",         "Provider": "Global X",   "HoldingsUrl": ""},
     {"Ticker": "BOTZ", "Name": "Global X Robotics & Artificial Intelligence ETF", "Category": "Theme",         "Theme": "Robotics & AI",           "Provider": "Global X",   "HoldingsUrl": ""},
     {"Ticker": "ROBT", "Name": "First Trust Nasdaq AI and Robotics ETF",          "Category": "Theme",         "Theme": "AI & Robotics",           "Provider": "First Trust","HoldingsUrl": ""},  # ★ 신규 추천
+
+    # ── Photonics ─────────────────────────────────────────────────────────────
+    {"Ticker": "FOTO", "Name": "Tuttle Capital Pure Play Photonics ETF",          "Category": "Theme",         "Theme": "Photonics",               "Provider": "Tuttle",     "HoldingsUrl": ""},
  
     # ── Software / Cloud ──────────────────────────────────────────────────────
     {"Ticker": "IGV",  "Name": "iShares Expanded Tech-Software Sector ETF",       "Category": "Theme",         "Theme": "Software",                "Provider": "iShares",    "HoldingsUrl": ""},
@@ -97,6 +106,7 @@ CURATED_ETFS = [
     # ── Innovation / Growth ───────────────────────────────────────────────────
     {"Ticker": "ARKK", "Name": "ARK Innovation ETF",                              "Category": "Theme",         "Theme": "Innovation",              "Provider": "ARK",        "HoldingsUrl": ""},
     {"Ticker": "ARKQ", "Name": "ARK Autonomous Technology & Robotics ETF",        "Category": "Theme",         "Theme": "Robotics",                "Provider": "ARK",        "HoldingsUrl": ""},
+    {"Ticker": "ARKG", "Name": "ARK Genomic Revolution ETF",                      "Category": "Theme",         "Theme": "Genomics",                "Provider": "ARK",        "HoldingsUrl": ""},
  
     # ── Healthcare ────────────────────────────────────────────────────────────
     {"Ticker": "IBB",  "Name": "iShares Biotechnology ETF",                       "Category": "Theme",         "Theme": "Biotech",                 "Provider": "iShares",    "HoldingsUrl": ""},
@@ -116,6 +126,10 @@ CURATED_ETFS = [
  
     # ── Materials / Mining ────────────────────────────────────────────────────
     {"Ticker": "COPX", "Name": "Global X Copper Miners ETF",                      "Category": "Theme",         "Theme": "Copper Miners",           "Provider": "Global X",   "HoldingsUrl": ""},
+    {"Ticker": "GDX",  "Name": "VanEck Gold Miners ETF",                          "Category": "Theme",         "Theme": "Gold Miners",             "Provider": "VanEck",     "HoldingsUrl": ""},
+
+    # ── Agriculture ───────────────────────────────────────────────────────────
+    {"Ticker": "MOO",  "Name": "VanEck Agribusiness ETF",                         "Category": "Theme",         "Theme": "Agribusiness",            "Provider": "VanEck",     "HoldingsUrl": ""},
  
     # ── Real Estate ───────────────────────────────────────────────────────────
     {"Ticker": "VNQ",  "Name": "Vanguard Real Estate ETF",                        "Category": "Sector",        "Theme": "Real Estate",             "Provider": "Vanguard",   "HoldingsUrl": ""},
@@ -134,6 +148,8 @@ CURATED_ETFS = [
 
     # ── Crypto / Digital Assets ───────────────────────────────────────────────
     {"Ticker": "WGMI", "Name": "Valkyrie Bitcoin Miners ETF",                    "Category": "Theme",         "Theme": "Bitcoin Mining",          "Provider": "Valkyrie",   "HoldingsUrl": ""},
+    {"Ticker": "IBIT", "Name": "iShares Bitcoin Trust ETF",                      "Category": "Theme",         "Theme": "Bitcoin (Spot)",          "Provider": "iShares",    "HoldingsUrl": ""},
+    {"Ticker": "ETHA", "Name": "iShares Ethereum Trust ETF",                     "Category": "Theme",         "Theme": "Ethereum (Spot)",         "Provider": "iShares",    "HoldingsUrl": ""},
 ]
 
 def _save_intermediate(df: pd.DataFrame, name: str) -> None:
@@ -195,13 +211,8 @@ def run_download() -> None:
     _save_intermediate(low_df, "low")
     _save_intermediate(volume_df, "volume")
 
-    # [Step 4] SPY 벤치마크 다운로드
-    print(f"[Step 4/7] SPY 벤치마크 다운로드...")
-    spy_close = download_spy_close(DOWNLOAD_PERIOD)
-    _save_series(spy_close, "spy_close")
-
-    # [Step 5] ETF 메타데이터 및 OHLCV 다운로드
-    print(f"[Step 5/7] ETF 메타데이터 및 OHLCV 다운로드...")
+    # [Step 4] ETF 메타데이터 및 OHLCV 다운로드
+    print(f"[Step 4/7] ETF 메타데이터 및 OHLCV 다운로드...")
     etf_info = pd.DataFrame(CURATED_ETFS).drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
     _save_intermediate(etf_info.set_index("Ticker"), "etf_info")
 
@@ -216,23 +227,30 @@ def run_download() -> None:
     _save_intermediate(etf_low_df, "etf_low")
     _save_intermediate(etf_volume_df, "etf_volume")
 
+    # [Step 5] SPY 벤치마크 추출 (ETF 종가/캐시에서 추출)
+    print(f"[Step 5/7] SPY 벤치마크 추출...")
+    spy_close = download_spy_close(DOWNLOAD_PERIOD, etf_close_df=etf_close_df)
+    _save_series(spy_close, "spy_close")
+
     # [Step 6] ETF 상위 보유종목 다운로드
-    print(f"[Step 6/7] ETF 상위 보유종목 다운로드 (top {ETF_TOP_HOLDINGS_LIMIT})...")
-    etf_top_holdings = fetch_etf_top_holdings(etf_info, limit=ETF_TOP_HOLDINGS_LIMIT)
-    # 레이트리밋 등으로 일부 ETF 수집이 실패해도 이전 파일의 해당 ETF 행을 보존해,
-    # 부분 실패가 기존 정상 데이터를 지우지 않게 한다 (보유종목은 천천히 변하므로 안전).
+    # 신선도 스킵: max_age_days 이내로 신선한 ETF는 재수집을 건너뛰고 캐시를 재사용한다.
+    # 수집 실패분 보존과 신선분 재사용은 fetch_etf_top_holdings 내부에서 함께 처리되므로,
+    # 반환 프레임은 항상 완전하다(전 ETF가 신선해 아무것도 안 받아도 캐시가 그대로 반환됨).
+    print(f"[Step 6/7] ETF 상위 보유종목 다운로드 (top {ETF_TOP_HOLDINGS_LIMIT}, "
+          f"{ETF_HOLDINGS_MAX_AGE_DAYS}일 신선도)...")
     prev_path = INTERMEDIATE_DIR / "etf_top_holdings.parquet"
-    if prev_path.exists() and not etf_top_holdings.empty:
+    prev_holdings = None
+    if prev_path.exists():
         try:
-            prev = pd.read_parquet(prev_path)
-            fetched_ok = set(etf_top_holdings["ETF"].unique())
-            keep = prev[~prev["ETF"].isin(fetched_ok)]
-            if not keep.empty:
-                etf_top_holdings = pd.concat([etf_top_holdings, keep], ignore_index=True)
-                print(f"  [ETF Holdings] 이번 수집 실패 {keep['ETF'].nunique()}개 ETF는 "
-                      f"이전 데이터 보존 ({len(keep)}행)")
+            prev_holdings = pd.read_parquet(prev_path)
         except Exception as e:
-            print(f"  [Warning] 이전 ETF 보유종목 병합 실패: {e}")
+            print(f"  [Warning] 이전 ETF 보유종목 로드 실패: {e}")
+    etf_top_holdings = fetch_etf_top_holdings(
+        etf_info,
+        limit=ETF_TOP_HOLDINGS_LIMIT,
+        prev=prev_holdings,
+        max_age_days=ETF_HOLDINGS_MAX_AGE_DAYS,
+    )
     _save_intermediate(etf_top_holdings, "etf_top_holdings")
 
     # [Step 7] 시가총액 데이터 수집 및 우회 계산 (수정된 핵심 파트)

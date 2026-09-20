@@ -32,6 +32,8 @@ _SCREENER_CFG_KEYS: list[str] = [
     "screener_rs_pct_filter_mode",
     "screener_slope_chk",
     "screener_phase_filter",
+    "screener_ma_stack_filter",
+    "screener_stack_days_min",
     "screener_etf_only",
     "screener_price_min",
     "screener_adv_min",
@@ -679,7 +681,7 @@ def _render_ranking_table(df: pd.DataFrame, height: int = 500, exclude_cols: lis
         "rs_rank", "ticker", "sector_name", "theme", "rs_score", "rs_slope",
         "price_chg_pct", "price_chg_5d_pct",
         "price_chg_1m_pct", "price_chg_3m_pct", "price_chg_6m_pct", "price_chg_1y_pct",
-        "rs_1m", "rs_3m", "rs_line_phase",
+        "rs_1m_pct", "rs_3m_pct", "rs_line_phase",
     ]
     if exclude_cols:
         candidate_cols = [c for c in candidate_cols if c not in exclude_cols]
@@ -696,8 +698,10 @@ def _render_ranking_table(df: pd.DataFrame, height: int = 500, exclude_cols: lis
         "price_chg_3m_pct": st.column_config.NumberColumn("3M 등락률", format="%.2f%%"),
         "price_chg_6m_pct": st.column_config.NumberColumn("6M 등락률", format="%.2f%%"),
         "price_chg_1y_pct": st.column_config.NumberColumn("1Y 등락률", format="%.2f%%"),
-        "rs_1m":            st.column_config.NumberColumn("1개월 RS",  format="%.3f"),
-        "rs_3m":         st.column_config.NumberColumn("3개월 RS",   format="%.3f"),
+        "rs_1m_pct":     st.column_config.ProgressColumn(
+            "1개월 RS 백분위", min_value=0, max_value=100, format="%.1f%%"),
+        "rs_3m_pct":     st.column_config.ProgressColumn(
+            "3개월 RS 백분위", min_value=0, max_value=100, format="%.1f%%"),
         "rs_line_phase": st.column_config.TextColumn("RS Phase"),
     }
 
@@ -722,6 +726,38 @@ def _render_ranking_table(df: pd.DataFrame, height: int = 500, exclude_cols: lis
 
 
 # ─── Daily Summary 헬퍼 함수 ──────────────────────────────────────────────────
+def _calc_power_trend(tickers: list[str]) -> dict[str, dict[str, Any]]:
+    """Power Trend 판정: 종가 > 21일 EMA > 50일 SMA 조건 충족 여부.
+
+    ETF 종가 프레임에서 각 티커의 최신 종가, 21일 지수이동평균(EMA),
+    50일 단순이동평균(SMA)을 계산해 Power Trend 조건을 판단한다.
+    데이터 부족 시 None을 반환한다.
+    """
+    close_df, _ = load_etf_price_frames()
+    if close_df.empty:
+        close_df = load_close_prices()
+    result: dict[str, dict[str, Any]] = {}
+    for ticker in tickers:
+        if close_df.empty or ticker not in close_df.columns:
+            result[ticker] = {"is_power_trend": None, "price": None, "ema_21": None, "sma_50": None}
+            continue
+        series = close_df[ticker].dropna()
+        if len(series) < 50:
+            result[ticker] = {"is_power_trend": None, "price": None, "ema_21": None, "sma_50": None}
+            continue
+        price = float(series.iloc[-1])
+        ema_21 = float(series.ewm(span=21, adjust=False).mean().iloc[-1])
+        sma_50 = float(series.rolling(50).mean().iloc[-1])
+        result[ticker] = {
+            "is_power_trend": price > ema_21 > sma_50,
+            "price": price,
+            "ema_21": ema_21,
+            "sma_50": sma_50,
+        }
+    return result
+
+
+
 def _calc_daily_return(rs_full: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     """최신 거래일의 실제 주가 등락률(price_chg_pct)을 daily_pct로 반환."""
     df = rs_full[rs_full["ticker"].isin(tickers)]
@@ -759,7 +795,7 @@ def _get_market_character(
     elif spy > 0 and qqq > spy * 1.5:
         text, color = "🚀 대형 성장주 주도 강세 — 나스닥 아웃퍼폼", "success"
     elif spy > 0 and iwm > spy:
-        text, color = "📈 광범위 강세 — 소형주 동반 상승, Breadth 건강", "success"
+        text, color = "📈 광범위 강세 — 소형주 동반 상승", "success"
     elif spy > 0 and iwm < 0:
         text, color = "⚡ 대형주만 강세 — 소형주 소외, 폭 좁은 상승", "warning"
     elif abs(spy) < 0.3:
@@ -832,10 +868,10 @@ def _join_rs_to_portfolio(portfolio_df: pd.DataFrame, rs_full: pd.DataFrame) -> 
         df["rs_signal"] = "⚪ 데이터없음"
         return df
 
-    latest = pd.to_datetime(rs_full["date"]).max()
+    latest = rs_full["date"].max()
     rs_today = (
         rs_full[
-            (pd.to_datetime(rs_full["date"]) == latest)
+            (rs_full["date"] == latest)
             & (~rs_full["ticker"].isin(BENCHMARK_TICKERS))
         ][["ticker", "rs_score", "rs_rank", "rs_slope", "rs_percentile"]]
         .drop_duplicates("ticker")
@@ -1210,7 +1246,7 @@ def _snapshot_daily_totals(portfolio_snapshot: pd.DataFrame) -> pd.DataFrame:
     filtered = _drop_dust_positions(portfolio_snapshot)
     if filtered.empty:
         # 보유가 전부 dust인 날도 예수금만으로 총자산을 남긴다.
-        out = cash_by_date.reset_index().rename(columns={"cash_usd": "cash_usd"})
+        out = cash_by_date.reset_index()
         out["market_value_usd"] = 0.0
         out["cash_usd"] = out["cash_usd"].fillna(0.0)
         out["equity_usd"] = out["cash_usd"]
@@ -1388,9 +1424,14 @@ def _enrich_holdings(
         df["holding_days"] = float("nan")
         df["position_open_date"] = pd.NaT
 
-    # 비중 — 주식 평가금액 합계 대비
+    # 비중 — 전체 자산(주식+현금) 대비
     total_eval = df["eval_amt_usd"].sum() if "eval_amt_usd" in df.columns else 0.0
-    df["weight_pct"] = (df["eval_amt_usd"] / total_eval * 100) if total_eval else 0.0
+    cash_usd = 0.0
+    if not df.empty and "cash_usd" in df.columns:
+        cash_usd = df["cash_usd"].iloc[0]
+
+    total_assets = total_eval + cash_usd
+    df["weight_pct"] = (df["eval_amt_usd"] / total_assets * 100) if total_assets > 0 else 0.0
 
     return df
 
@@ -1502,11 +1543,11 @@ def _calc_priority_score_industry(industry_strength: float) -> float:
     """
     소속 산업 RS 강도 점수 (0~20점).
 
-    industry_strength = 해당 산업의 주도주(상위 10~20종목) 평균 RS 백분위 (0~100).
+    industry_strength = 해당 산업의 주도주(상위 5~20종목) 평균 RS 백분위 (0~100).
     백분위가 높을수록(주도 산업) 높은 점수.
 
     Args:
-        industry_strength (float): 산업 주도주(상위 10~20종목) 평균 RS 백분위
+        industry_strength (float): 산업 주도주(상위 5~20종목) 평균 RS 백분위
 
     Returns:
         float: 0.0 ~ 20.0 (NaN → 0)
@@ -1604,7 +1645,7 @@ def _calc_priority_score(row: pd.Series) -> float:
         row.get("rs_line_52w_high", float("nan")),
     )
 
-    # ④ 산업 강도 (20점) — 소속 산업 주도주(상위 10~20종목) 평균 RS 백분위
+    # ④ 산업 강도 (20점) — 소속 산업 주도주(상위 5~20종목) 평균 RS 백분위
     score_industry = _calc_priority_score_industry(row.get("industry_rs_percentile", float("nan")))
 
     # ⑤ Extension 페널티 (20점)
@@ -1642,9 +1683,9 @@ def _build_watchlist_data(
         return pd.DataFrame()
 
     # 최신 날짜 RS 데이터
-    latest_date = pd.to_datetime(rs_full["date"]).max()
+    latest_date = rs_full["date"].max()
     rs_today = (
-        rs_full[pd.to_datetime(rs_full["date"]) == latest_date]
+        rs_full[rs_full["date"] == latest_date]
         .drop_duplicates("ticker")
         .set_index("ticker")
     )
@@ -1747,7 +1788,7 @@ def render_sidebar(rs_full: pd.DataFrame) -> None:
         st.caption("IBD RS Score 기준 분석")
 
         st.divider()
-        latest_date = pd.to_datetime(rs_full["date"]).max()
+        latest_date = rs_full["date"].max()
         st.caption(f"기준일: {latest_date.strftime('%Y-%m-%d')}")
 
         st.divider()
@@ -1771,9 +1812,9 @@ def _show_sector_tab(sector_summary: pd.DataFrame, rs_full: pd.DataFrame) -> Non
     with st.container():
         st.markdown("#### 시장 RS 순위표")
         st.caption("주요 지수 ETF 비교 — 대형/중형/소형, 시총가중 vs 동일가중")
-        latest_date = pd.to_datetime(rs_full["date"]).max()
+        latest_date = rs_full["date"].max()
         mkt = rs_full[
-            (pd.to_datetime(rs_full["date"]) == latest_date)
+            (rs_full["date"] == latest_date)
             & (rs_full["ticker"].isin(MARKET_INDEX_TICKERS))
         ].drop_duplicates("ticker").copy()
         if mkt.empty:
@@ -1784,7 +1825,7 @@ def _show_sector_tab(sector_summary: pd.DataFrame, rs_full: pd.DataFrame) -> Non
             mkt["rs_rank"] = range(1, len(mkt) + 1)
             _render_ranking_table(
                 mkt, height=250,
-                exclude_cols=["rs_score", "rs_slope", "rs_1m", "rs_3m", "rs_line_phase"],
+                exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
             )
 
     # 섹션 B: 섹터 RS 순위표
@@ -1792,7 +1833,7 @@ def _show_sector_tab(sector_summary: pd.DataFrame, rs_full: pd.DataFrame) -> Non
         st.markdown("#### 섹터 RS 순위표")
         _render_ranking_table(
             df, height=550,
-            exclude_cols=["rs_score", "rs_slope", "rs_1m", "rs_3m", "rs_line_phase"],
+            exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
         )
 
     # 섹션 C: RS Line 추이
@@ -1836,17 +1877,17 @@ INDUSTRY_JUNK_LABELS: set[str] = {"", "Unknown", "Other", "Shell Companies", "N/
 # ── 산업 '주도주' 표본 규칙 (순위표·추이 차트 공통) ──────────────────────────
 # 각 산업에서 RS 백분위 상위 몇 종목을 주도주로 보고 평균을 낼지 정한다.
 # 기본은 상위 절반이되, 양끝을 [MIN, MAX]로 자른다:
-#   - 하한 10: 표본이 너무 작으면 평균이 출렁인다.
+#   - 하한 5: 표본이 너무 작으면 평균이 출렁인다.
 #   - 상한 20: 상한이 없으면 대형 산업은 수백 종목을 평균해 '주도주'가 희석된다.
-# 결과적으로 모든 산업이 10~20종목이라는 비슷한 크기의 주도주 집단으로 비교된다.
+# 결과적으로 모든 산업이 5~20종목이라는 비슷한 크기의 주도주 집단으로 비교된다.
 # (대형 산업일수록 더 엄선된 상위권만 표본이 되므로 순위에서 유리해진다 — 의도된 동작:
 #  "주도주를 많이 거느린 산업이 곧 주도 산업"이라는 관점을 따른다.)
 INDUSTRY_LEADER_FRAC: float = 0.5
-INDUSTRY_LEADER_MIN: int = 10
+INDUSTRY_LEADER_MIN: int = 5
 INDUSTRY_LEADER_MAX: int = 20
-# 순위 기준 모집단: 종목 수가 이보다 적은 산업은 주도주 10종목을 채울 수 없어
+# 순위 기준 모집단: 종목 수가 이보다 적은 산업은 주도주 5종목을 채울 수 없어
 # 순위에서 제외한다. 앱 전체(산업 탭·스크리너·Watch List)가 이 기준을 공유한다.
-INDUSTRY_RANK_MIN_COUNT: int = 10
+INDUSTRY_RANK_MIN_COUNT: int = 5
 
 
 def _industry_leader_count(n: int) -> int:
@@ -1894,10 +1935,11 @@ def _build_industry_summary(
     # 산업 전체 종목 수 (treemap 크기 / min_count 필터용)
     counts = df.groupby("industry")["ticker"].size().rename("stock_count")
 
-    # rs_1m_pct / rs_3m_pct 사전 계산 (top 선별 전에 df에 추가)
+    # rs_1m_pct / rs_3m_pct — rs_engine에서 사전 계산됨. 없으면(구버전 파켓) fallback 계산.
     for col in ("rs_1m", "rs_3m"):
-        if col in df.columns:
-            df[f"{col}_pct"] = df[col].rank(pct=True) * 100
+        pct_col = f"{col}_pct"
+        if pct_col not in df.columns and col in df.columns:
+            df[pct_col] = df[col].rank(pct=True) * 100
 
     # 각 산업의 RS 백분위 상위 주도주만 선별 (NaN 백분위는 정렬상 자동 후순위).
     # keep_n이 실제 종목 수보다 커도 within_rank 비교가 전체를 취하므로 안전.
@@ -1912,7 +1954,7 @@ def _build_industry_summary(
         "rs_percentile": ("rs_percentile", "mean"),
         "rs_slope":      ("rs_slope",      "mean"),
     }
-    for col in ("rs_1m", "rs_3m", "price_chg_pct", "price_chg_5d_pct", "rs_1m_pct", "rs_3m_pct"):
+    for col in ("price_chg_pct", "price_chg_5d_pct", "rs_1m_pct", "rs_3m_pct"):
         if col in top.columns:
             agg_dict[col] = (col, "mean")
     summary = top.groupby("industry").agg(**agg_dict)
@@ -2102,7 +2144,7 @@ def _show_industry_tab(screener: pd.DataFrame, rs_full: pd.DataFrame) -> None:
         members = screener[screener["industry"].astype(str).str.strip() == drill].copy()
         member_cols = [c for c in [
             "ticker", "rs_rank", "rs_percentile", "rs_score", "rs_slope",
-            "price_chg_pct", "rs_1m", "rs_3m", "rs_line_phase",
+            "price_chg_pct", "rs_1m_pct", "rs_3m_pct", "rs_line_phase",
             "latest_price", "market_cap", "parent_etf",
         ] if c in members.columns]
         members = members.sort_values("rs_percentile", ascending=False)
@@ -2119,8 +2161,10 @@ def _show_industry_tab(screener: pd.DataFrame, rs_full: pd.DataFrame) -> None:
                 "rs_score":      st.column_config.NumberColumn("RS Score",  format="%.3f"),
                 "rs_slope":      st.column_config.NumberColumn("RS Slope",  format="%.4f"),
                 "price_chg_pct": st.column_config.NumberColumn("1D 등락률", format="%.2f%%"),
-                "rs_1m":         st.column_config.NumberColumn("1개월 RS",  format="%.3f"),
-                "rs_3m":         st.column_config.NumberColumn("3개월 RS",  format="%.3f"),
+                "rs_1m_pct":     st.column_config.ProgressColumn(
+                    "1개월 RS 백분위", min_value=0, max_value=100, format="%.1f%%"),
+                "rs_3m_pct":     st.column_config.ProgressColumn(
+                    "3개월 RS 백분위", min_value=0, max_value=100, format="%.1f%%"),
                 "rs_line_phase": st.column_config.TextColumn("RS Phase"),
                 "latest_price":  st.column_config.NumberColumn("현재가",    format="$%.2f"),
                 "market_cap":    st.column_config.NumberColumn("시가총액",   format="$%.2e"),
@@ -2155,7 +2199,7 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
         st.markdown("#### 테마 ETF RS 순위표")
         _render_ranking_table(
             df, height=550,
-            exclude_cols=["rs_score", "rs_slope", "rs_1m", "rs_3m", "rs_line_phase"],
+            exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
         )
 
     # 섹션 D: RS Line 추이
@@ -2266,6 +2310,14 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
             key="screener_phase_filter",
             help="강세: EMA 위 또는 이탈 3일 이내. 약세: EMA 아래 4일 이상. 비워두면 전체 표시.",
         )
+        selected_ma_stack = st.multiselect(
+            "RS Line MA 정배열 필터",
+            options=["정배열", "혼조", "역배열"],
+            default=[],
+            key="screener_ma_stack_filter",
+            help="정배열: RS Line > 20SMA > 50SMA. 단기·중기 추세가 모두 정렬된 "
+                 "추세적 강세주. 비워두면 전체 표시.",
+        )
     with f4:
         etf_only = st.checkbox(
             "ETF 편입 종목만", value=False, key="screener_etf_only"
@@ -2278,7 +2330,7 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         )
 
     # ── 필터 컨트롤 행 2 (Price / ADV / 시가총액 / ATR% / 50일선 이격도 / 업종 순위) ──────
-    g1, g2, g3, g4, g5, g6 = st.columns([3, 3, 3, 3, 3, 3])
+    g1, g2, g3, g4, g5, g6, g7 = st.columns([3, 3, 3, 3, 3, 3, 3])
 
     with g1:
         price_min = st.number_input(
@@ -2319,17 +2371,24 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
             key="screener_ind_rank_max",
             help="해당 순위 이내 업종에 속한 종목만 표시. 0이면 필터 미적용.",
         )
+    with g7:
+        stack_days_min = st.number_input(
+            "정배열 연속 유지일 최솟값",
+            min_value=0, value=0, step=5,
+            key="screener_stack_days_min",
+            help="RS Line 정배열이 N일 이상 연속된 종목만 표시. 0이면 필터 미적용.",
+        )
 
     # ── 정렬 기준 선택 + 설정 저장 ───────────────────────────────────────────
     sort_col1, sort_col2, sort_col3 = st.columns([3, 5, 2])
     with sort_col1:
         sort_options = {
-            "1개월 RS (단기)":    "rs_1m",
-            "3개월 RS (중기)":    "rs_3m",
+            "1개월 RS 백분위 (단기)":    "rs_1m_pct",
+            "3개월 RS 백분위 (중기)":    "rs_3m_pct",
             "RS Percentile":       "rs_percentile",
 
             "RS Slope":            "rs_slope",
-            "EMA 위 비중":        "rs_line_above_ema_pct",
+            "정배열 유지일":        "rs_line_stack_days",
         }
         sort_label = st.selectbox(
             "정렬 기준",
@@ -2351,10 +2410,12 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         if not _ind_summary.empty:
             _ind_rank_map = _ind_summary.set_index("industry")["rs_rank"].to_dict()
             screener["ind_rs_rank"] = screener["industry"].map(_ind_rank_map)
+    # rs_1m_pct / rs_3m_pct — rs_engine에서 사전 계산됨. 없으면(구버전 파켓) fallback 계산.
     for _col in ("rs_1m", "rs_3m"):
-        if _col in screener.columns:
+        _pct_col = f"{_col}_pct"
+        if _pct_col not in screener.columns and _col in screener.columns:
             _pct_map = dict(zip(screener["ticker"], (screener[_col].rank(pct=True) * 100).round(1)))
-            screener[f"{_col}_pct"] = screener["ticker"].map(_pct_map)
+            screener[_pct_col] = screener["ticker"].map(_pct_map)
 
     # ── 필터 적용 ─────────────────────────────────────────────────────────────
     filtered = screener.copy()
@@ -2373,6 +2434,10 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         filtered = filtered[filtered["rs_slope"] > 0]
     if selected_phase and "rs_line_phase" in filtered.columns:
         filtered = filtered[filtered["rs_line_phase"].isin(selected_phase)]
+    if selected_ma_stack and "rs_line_ma_stack" in filtered.columns:
+        filtered = filtered[filtered["rs_line_ma_stack"].isin(selected_ma_stack)]
+    if stack_days_min > 0 and "rs_line_stack_days" in filtered.columns:
+        filtered = filtered[filtered["rs_line_stack_days"].fillna(0) >= stack_days_min]
     if etf_only and "parent_etf" in filtered.columns:
         filtered = filtered[filtered["parent_etf"] != ""]
     if ticker_search.strip():
@@ -2414,7 +2479,7 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         "price_chg_pct", "price_chg_5d_pct",
         "price_chg_1m_pct", "price_chg_3m_pct", "price_chg_6m_pct", "price_chg_1y_pct",
         "rs_percentile", "rs_1m_pct", "rs_3m_pct",
-        "rs_line_phase", "atr_multiple",
+        "rs_line_phase", "rs_line_ma_stack", "rs_line_stack_days", "atr_multiple",
         "latest_price", "adv_m", "mktcap_b", "atr_pct",
         "parent_etf", "theme",
     ] if c in filtered.columns]
@@ -2444,6 +2509,8 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         "rs_3m_pct":     st.column_config.ProgressColumn(
             "3m RS 백분위", min_value=0, max_value=100, format="%.1f%%"),
         "rs_line_phase": st.column_config.TextColumn("RS Phase"),
+        "rs_line_ma_stack":   st.column_config.TextColumn("MA 정배열"),
+        "rs_line_stack_days": st.column_config.NumberColumn("정배열 유지일", format="%d"),
     }
 
     def _phase_row_color(row) -> list[str]:
@@ -2472,6 +2539,23 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
             height=600,
         )
 
+    # ── 티커 목록 복사 ────────────────────────────────────────────────────────
+    # st.code 우측 상단의 복사 버튼으로 클립보드에 그대로 담긴다.
+    if "ticker" in filtered.columns and not filtered.empty:
+        tickers = filtered["ticker"].dropna().astype(str).str.strip()
+        tickers = tickers[tickers != ""].drop_duplicates().tolist()
+
+        with st.expander(f"📋 티커 목록 복사 ({len(tickers):,}개)"):
+            sep_label = st.radio(
+                "구분자",
+                options=["쉼표 (NVDA, TSLA)", "공백 (NVDA TSLA)", "줄바꿈"],
+                index=0,
+                horizontal=True,
+                key="screener_copy_sep",
+            )
+            sep = {"쉼표 (NVDA, TSLA)": ", ", "공백 (NVDA TSLA)": " "}.get(sep_label, "\n")
+            st.code(sep.join(tickers), language=None, wrap_lines=True)
+
 
 # ─── Tab 4: Market Breadth ────────────────────────────────────────────────────
 def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
@@ -2492,6 +2576,15 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
     )
     days = period_map[period_label]
     df = breadth_df.sort_values("date").tail(days).copy()
+
+    # 주말 및 공휴일(데이터 없는 일자) x축 제외용 rangebreaks 설정
+    dates_present = pd.to_datetime(df["date"]).dt.normalize()
+    all_dates = pd.date_range(start=dates_present.min(), end=dates_present.max(), freq="D")
+    missing_dates = all_dates.difference(dates_present)
+    weekday_holidays = [d.strftime("%Y-%m-%d") for d in missing_dates if d.weekday() < 5]
+    rangebreaks = [dict(bounds=["sat", "mon"])]
+    if weekday_holidays:
+        rangebreaks.append(dict(values=weekday_holidays))
 
     # 요약 지표 카드
     latest = df.iloc[-1]
@@ -2536,6 +2629,7 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
             hovermode="x unified",
             bargap=0.1,
         )
+        fig_nnh.update_xaxes(rangebreaks=rangebreaks)
         st.plotly_chart(fig_nnh, width='stretch')
 
         nnh_slope = df["nnh_ma20"].diff(5).iloc[-1]
@@ -2600,6 +2694,7 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
             legend=dict(orientation="h", y=-0.2),
             hovermode="x unified",
         )
+        fig_ma.update_xaxes(rangebreaks=rangebreaks)
         st.plotly_chart(fig_ma, width='stretch')
 
     st.divider()
@@ -2626,6 +2721,7 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
                 hovermode="x unified",
                 showlegend=False,
             )
+            fig_ad.update_xaxes(rangebreaks=rangebreaks)
             st.plotly_chart(fig_ad, width='stretch')
 
         with col_right:
@@ -2667,6 +2763,7 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
             margin=dict(t=10, b=40, l=0, r=0),
             bargap=0.1,
         )
+        fig_score.update_xaxes(rangebreaks=rangebreaks)
         st.plotly_chart(fig_score, width='stretch')
 
 
@@ -2720,6 +2817,7 @@ def _show_portfolio_tab(
             if not today_snap.empty and "cash_usd" in today_snap.columns else 0.0
         )
         total_asset = stock_value + cash_usd
+        stock_weight = (stock_value / total_asset * 100) if total_asset else 0.0
         cash_weight = (cash_usd / total_asset * 100) if total_asset else 0.0
 
         unreal_pnl = float(holdings["pnl_usd"].sum()) if not holdings.empty else 0.0
@@ -2738,7 +2836,8 @@ def _show_portfolio_tab(
 
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("총 자산", f"${total_asset:,.0f}")
-        c2.metric("주식 평가금액", f"${stock_value:,.0f}")
+        c2.metric("주식 평가금액", f"${stock_value:,.0f}", delta=f"비중 {stock_weight:.1f}%",
+                  delta_color="off")
         c3.metric("예수금", f"${cash_usd:,.0f}", delta=f"비중 {cash_weight:.1f}%",
                   delta_color="off")
         c4.metric("평가손익", f"${unreal_pnl:+,.0f}", delta=f"{unreal_pct:+.2f}%")
@@ -3322,11 +3421,16 @@ def _show_watchlist_tab(
         st.warning("rs_full에서 Watch List 종목 데이터를 찾을 수 없습니다.")
         return
 
-    # rs_1m_pct / rs_3m_pct — 전체 스크리너 기준 백분위
+    # rs_1m_pct / rs_3m_pct — rs_engine 사전 계산값 사용. 없으면(구버전 파켓) fallback 계산.
     for _col in ("rs_1m", "rs_3m"):
-        if _col in screener.columns:
+        _pct_col = f"{_col}_pct"
+        if _pct_col in screener.columns:
+            _pct_map = dict(zip(screener["ticker"], screener[_pct_col]))
+        elif _col in screener.columns:
             _pct_map = dict(zip(screener["ticker"], (screener[_col].rank(pct=True) * 100).round(1)))
-            wl_df[f"{_col}_pct"] = wl_df["ticker"].map(_pct_map)
+        else:
+            continue
+        wl_df[_pct_col] = wl_df["ticker"].map(_pct_map)
 
     st.divider()
 
@@ -3342,7 +3446,7 @@ def _show_watchlist_tab(
             if i >= 6:
                 break
             score  = row.get("priority_score", 0)
-            ticker = row["ticker"]
+            ticker = html.escape(str(row["ticker"]))
             with cols[i]:
                 if i == 0:
                     st.markdown(
@@ -3359,14 +3463,15 @@ def _show_watchlist_tab(
                         unsafe_allow_html=True,
                     )
                 else:
+                    # 색상은 라이트/다크 테마 모두에서 읽히도록 중립 rgba + inherit로.
                     st.markdown(
                         f"""
-                        <div style="border:1px solid #d0d7de;border-radius:12px;
-                                    padding:16px 10px;text-align:center;background:#ffffff;">
-                          <div style="font-size:13px;font-weight:600;color:#57606a;">{i+1}순위</div>
-                          <div style="font-size:22px;font-weight:700;margin:4px 0;color:#24292f;">{ticker}</div>
+                        <div style="border:1px solid rgba(128,128,128,0.3);border-radius:12px;
+                                    padding:16px 10px;text-align:center;background:rgba(128,128,128,0.06);">
+                          <div style="font-size:13px;font-weight:600;color:rgba(128,128,128,0.95);">{i+1}순위</div>
+                          <div style="font-size:22px;font-weight:700;margin:4px 0;">{ticker}</div>
                           <div style="font-size:32px;font-weight:800;line-height:1;color:#378ADD;">{score:.0f}</div>
-                          <div style="font-size:11px;color:#8b949e;">/ 100점</div>
+                          <div style="font-size:11px;color:rgba(128,128,128,0.8);">/ 100점</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
@@ -3397,7 +3502,7 @@ def _show_watchlist_tab(
             f"({'✅ 신고가 경신' if _ratio >= 1.0 else f'{(1-_ratio)*100:.1f}% 이내'})"
         )
 
-        # ⑥ Extension 상세
+        # ⑤ Extension 상세
         _atr_mult = top_row.get("atr_multiple", float("nan"))
         _ext_pts  = _calc_priority_score_extension(_atr_mult)
         if pd.isna(_atr_mult):
@@ -3429,10 +3534,10 @@ def _show_watchlist_tab(
                     f"""
                     <div style="margin:8px 0;">
                       <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:3px;">
-                        <span style="font-weight:600;">{label} ({maxpts}점)</span>
-                        <span style="color:#57606a;">{pts:.0f}점 · {detail}</span>
+                        <span style="font-weight:600;">{html.escape(label)} ({maxpts}점)</span>
+                        <span style="color:rgba(128,128,128,0.95);">{pts:.0f}점 · {html.escape(str(detail))}</span>
                       </div>
-                      <div style="background:#eaeef2;border-radius:6px;height:10px;overflow:hidden;">
+                      <div style="background:rgba(128,128,128,0.2);border-radius:6px;height:10px;overflow:hidden;">
                         <div style="background:#378ADD;width:{pct_bar:.0f}%;height:100%;"></div>
                       </div>
                     </div>
@@ -3615,7 +3720,7 @@ def _show_daily_summary_tab(
     breadth_df: pd.DataFrame,
 ) -> None:
     st.subheader("📅 Daily Summary")
-    st.caption(f"기준일: {pd.to_datetime(rs_full['date']).max().strftime('%Y-%m-%d')} 마감 기준")
+    st.caption(f"기준일: {rs_full['date'].max().strftime('%Y-%m-%d')} 마감 기준")
 
     breadth_today = breadth_df.sort_values("date").iloc[-1] if not breadth_df.empty else pd.Series(dtype=float)
 
@@ -3665,6 +3770,33 @@ def _show_daily_summary_tab(
         else:
             st.info(char_text)
 
+        # Power Trend 판정 (Price > 21 EMA > 50 SMA)
+        power_trends = _calc_power_trend(["SPY", "QQQ"])
+        pt_cols = st.columns(2)
+        for pt_col, ticker in zip(pt_cols, ["SPY", "QQQ"]):
+            pt_data = power_trends.get(ticker, {})
+            pt_val = pt_data.get("is_power_trend")
+            price = pt_data.get("price")
+            ema_21 = pt_data.get("ema_21")
+            sma_50 = pt_data.get("sma_50")
+            if pt_val is None:
+                pt_label = "N/A"
+                pt_icon = "❓"
+                help_txt = "데이터가 충분하지 않습니다 (최소 50거래일 필요)."
+            elif pt_val:
+                pt_label = "Yes"
+                pt_icon = "✅"
+                help_txt = f"조건 만족: 가격(${price:.2f}) > 21 EMA(${ema_21:.2f}) > 50 SMA(${sma_50:.2f})"
+            else:
+                pt_label = "No"
+                pt_icon = "❌"
+                help_txt = f"조건 미만족: 가격(${price:.2f}), 21 EMA(${ema_21:.2f}), 50 SMA(${sma_50:.2f})"
+            pt_col.metric(
+                label=f"{ticker} Power Trend",
+                value=f"{pt_icon} {pt_label}",
+                help=help_txt,
+            )
+
     st.divider()
 
     # ── 섹션 2: Performance Tables ─────────────────────────────────────────
@@ -3697,28 +3829,31 @@ def main() -> None:
     st.set_page_config(page_title="RS Dashboard", page_icon="📊", layout="wide")
     _inject_dashboard_css()
 
-    sector_summary = load_sector_summary()
-    theme_summary  = load_theme_summary()
-    screener       = load_screener()
-    rs_full        = load_rs_full()
+    sector_summary  = load_sector_summary()
+    theme_summary   = load_theme_summary()
+    screener        = load_screener()
+    rs_full         = load_rs_full()
+    # st.tabs는 숨은 탭 본문도 매 리렌더 실행하므로 어차피 전부 로드된다.
+    # 여러 탭이 공유하는 프레임은 여기서 한 번만 로드해 넘긴다(@st.cache_data라 비용은 동일).
+    breadth_df      = load_breadth_metrics()
+    tech_indicators = load_technical_indicators()
 
     render_sidebar(rs_full)
 
     st.title("📊 RS Dashboard")
 
-    tab1, tab2, tab_ind, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab_ind, tab4, tab5, tab6, tab7 = st.tabs([
         "📅 Daily Summary",
+        "🩺 Market Breadth",
         "📊 섹터 분석",
         "🏭 산업 분석",
         "🎯 테마 분석",
         "🔍 종목 스크리너",
-        "🩺 Market Breadth",
         "💼 포트폴리오",
         "👀 Watch List",
     ])
 
     with tab1:
-        breadth_df = load_breadth_metrics()
         _show_daily_summary_tab(
             rs_full=rs_full,
             theme_summary=theme_summary,
@@ -3726,20 +3861,19 @@ def main() -> None:
         )
 
     with tab2:
+        _show_breadth_tab(breadth_df)
+
+    with tab3:
         _show_sector_tab(sector_summary, rs_full)
 
     with tab_ind:
         _show_industry_tab(screener, rs_full)
 
-    with tab3:
+    with tab4:
         _show_theme_tab(theme_summary, rs_full)
 
-    with tab4:
-        _show_screener_tab(screener, load_technical_indicators())
-
     with tab5:
-        breadth_df = load_breadth_metrics()
-        _show_breadth_tab(breadth_df)
+        _show_screener_tab(screener, tech_indicators)
 
     with tab6:
         _show_portfolio_tab(
@@ -3747,7 +3881,7 @@ def main() -> None:
             trade_history      = load_trade_history(),
             rs_full            = rs_full,
             screener           = screener,
-            tech_indicators    = load_technical_indicators(),
+            tech_indicators    = tech_indicators,
             close_df           = load_close_prices(),
         )
 
@@ -3755,7 +3889,7 @@ def main() -> None:
         _show_watchlist_tab(
             rs_full         = rs_full,
             screener        = screener,
-            tech_indicators = load_technical_indicators(),
+            tech_indicators = tech_indicators,
         )
 
 

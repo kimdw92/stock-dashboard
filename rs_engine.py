@@ -244,6 +244,85 @@ def calc_rs_line_phase(
     return df[["date", "ticker", "rs_line_ema21", "rs_line_phase"]]
 
 
+def calc_rs_line_ma_stack(
+    prices: pd.DataFrame,
+    benchmark: str = "SPY",
+    short_window: int = 20,
+    long_window: int = 50,
+) -> pd.DataFrame:
+    """
+    RS Line의 20/50일 SMA 정배열 판정.
+
+    RS Line 자체에 이동평균을 입혀 단기(20일)·중기(50일) 추세가 모두
+    같은 방향으로 정렬됐는지 확인한다. rs_line_phase(21EMA, 3일 유예)가
+    최근 며칠만 보는 것과 달리, 최소 수주~수개월간 지속적으로 시장을
+    아웃퍼폼하는 추세적 강세주를 선별하는 용도.
+
+    판정 기준:
+      정배열:      rs_line > SMA20 > SMA50
+      역배열:      rs_line < SMA20 < SMA50
+      혼조:        그 외
+      데이터 없음: SMA50 산출 불가(상장 50일 미만) 또는 rs_line NaN
+
+    rs_line_stack_days: 연속 정배열 유지 일수 (정배열 아니면 0, 판정 불가 시 NaN)
+
+    Args:
+        prices (pd.DataFrame): date x ticker pivot 테이블 (load_prices 출력물)
+        benchmark (str): 기준 티커 (기본값 "SPY")
+        short_window (int): 단기 SMA 기간 (기본값 20)
+        long_window (int): 중기 SMA 기간 (기본값 50)
+
+    Returns:
+        pd.DataFrame: Long format
+        컬럼: date, ticker, rs_line_sma20, rs_line_sma50,
+               rs_line_ma_stack, rs_line_stack_days
+    """
+    logger.info(
+        f"RS Line MA Stack(정배열) 계산 중 "
+        f"(SMA{short_window}/{long_window}, 벤치마크: {benchmark})"
+    )
+    if benchmark not in prices.columns:
+        raise ValueError(f"벤치마크 종목 '{benchmark}'이(가) 데이터에 존재하지 않습니다.")
+
+    # wide 연산: 전 종목 동시 rolling — long format groupby.transform 대비 훨씬 빠름
+    rs_line = prices.div(prices[benchmark], axis=0)
+    sma_s = rs_line.rolling(short_window).mean()   # min_periods 기본값 = window
+    sma_l = rs_line.rolling(long_window).mean()
+
+    aligned  = (rs_line > sma_s) & (sma_s > sma_l)
+    inverted = (rs_line < sma_s) & (sma_s < sma_l)
+    valid    = sma_l.notna() & rs_line.notna()
+
+    # 연속 정배열 일수 (컬럼별 run-length, 벡터 연산)
+    # 직전 비정배열 시점의 cumsum을 빼면 현재 연속 구간 길이가 남는다
+    _cum   = aligned.cumsum()
+    _reset = _cum.where(~aligned).ffill().fillna(0)
+    stack_days = (_cum - _reset).where(aligned, 0).where(valid)
+
+    # np.select는 앞 조건 우선 → ~valid를 먼저 두어 NaN이 '혼조'로 새지 않게 한다
+    label = np.select(
+        [(~valid).to_numpy(), aligned.to_numpy(), inverted.to_numpy()],
+        ["데이터 없음", "정배열", "역배열"],
+        default="혼조",
+    )
+    ma_stack = pd.DataFrame(label, index=rs_line.index, columns=rs_line.columns)
+
+    def _to_long(wide: pd.DataFrame, value_name: str) -> pd.DataFrame:
+        r = wide.reset_index()
+        r.rename(columns={r.columns[0]: 'date'}, inplace=True)
+        return r.melt(id_vars='date', var_name='ticker', value_name=value_name)
+
+    result = _to_long(sma_s, 'rs_line_sma20')
+    for wide, name in [
+        (sma_l,      'rs_line_sma50'),
+        (ma_stack,   'rs_line_ma_stack'),
+        (stack_days, 'rs_line_stack_days'),
+    ]:
+        result = result.merge(_to_long(wide, name), on=['date', 'ticker'], how='left')
+
+    return result
+
+
 def calc_rs_slope(rs_series: pd.Series, window: int = 20) -> pd.Series:
     """
     최근 window일간의 RS Line 값에 대해 선형회귀 기울기(slope)를 계산 (벡터화 최적화).
@@ -293,7 +372,13 @@ def rank_rs(rs_df: pd.DataFrame, period_col: str = "rs_score") -> pd.DataFrame:
     # 같은 날짜 내에서 순위 평가 (값이 클수록 높은 순위/백분위)
     df['rs_rank'] = df.groupby('date')[period_col].rank(ascending=False, method='min')
     df['rs_percentile'] = df.groupby('date')[period_col].rank(pct=True) * 100
-    
+
+    # 단기 RS 백분위 사전 계산 (rs_percentile과 동일 기준: 같은 날짜 전체 유니버스)
+    # → app.py에서 매 렌더마다 .rank(pct=True) 하던 것을 파이프라인에서 1회 계산으로 대체
+    for _col in ("rs_1m", "rs_3m"):
+        if _col in df.columns:
+            df[f"{_col}_pct"] = df.groupby('date')[_col].rank(pct=True) * 100
+
     return df
 
 
@@ -320,7 +405,7 @@ def build_sector_summary(rs_df: pd.DataFrame, sector_tickers: List[str], sector_
         sector_df['sector_name'] = sector_df['ticker']
     
     cols = ['ticker', 'sector_name', 'rs_score', 'rs_slope', 'rs_rank',
-            'rs_1m', 'rs_3m', 'rs_line_phase',
+            'rs_1m', 'rs_3m', 'rs_1m_pct', 'rs_3m_pct', 'rs_line_phase',
             'price_chg_pct', 'price_chg_5d_pct',
             'price_chg_1m_pct', 'price_chg_3m_pct', 'price_chg_6m_pct', 'price_chg_1y_pct']
     cols = [c for c in cols if c in sector_df.columns]
@@ -357,7 +442,7 @@ def build_theme_summary(rs_df: pd.DataFrame, theme_map: Dict[str, List[str]]) ->
         
     result_df = pd.DataFrame(records)
     cols = ['ticker', 'theme', 'rs_score', 'rs_slope', 'rs_rank',
-            'rs_1m', 'rs_3m', 'rs_line_phase',
+            'rs_1m', 'rs_3m', 'rs_1m_pct', 'rs_3m_pct', 'rs_line_phase',
             'price_chg_pct', 'price_chg_5d_pct',
             'price_chg_1m_pct', 'price_chg_3m_pct', 'price_chg_6m_pct', 'price_chg_1y_pct']
     cols = [c for c in cols if c in result_df.columns]
@@ -387,7 +472,8 @@ def build_stock_screener(
 
     Returns:
         pd.DataFrame: ticker, rs_rank, rs_percentile, rs_score, rs_slope,
-                      latest_price, avg_dollar_volume, market_cap, parent_etf, theme
+                      latest_price, avg_dollar_volume, market_cap, parent_etf, theme,
+                      rs_line_ma_stack, rs_line_stack_days (RS Line 20/50 SMA 정배열)
                       (rs_percentile 내림차순)
     """
     logger.info("종목 스크리너 생성 (전체 유니버스 기준)")
@@ -462,7 +548,8 @@ def build_stock_screener(
     cols = ['ticker', 'rs_rank', 'rs_percentile', 'rs_score', 'rs_slope',
             'latest_price', 'avg_dollar_volume', 'market_cap', 'industry', 'parent_etf', 'theme',
             'rs_line_ema21', 'rs_line_phase', 'rs_line_3m_pct', 'rs_line_1m_pct',
-            'rs_1m', 'rs_3m',
+            'rs_line_ma_stack', 'rs_line_stack_days', 'rs_line_sma20', 'rs_line_sma50',
+            'rs_1m', 'rs_3m', 'rs_1m_pct', 'rs_3m_pct',
             'price_chg_pct', 'price_chg_5d_pct',
             'price_chg_1m_pct', 'price_chg_3m_pct', 'price_chg_6m_pct', 'price_chg_1y_pct']
     cols = [c for c in cols if c in stocks_df.columns]
@@ -808,6 +895,12 @@ def run_pipeline(config: Dict[str, Any]) -> None:
         how="left"
     )
 
+    # RS Line 20/50 SMA 정배열 계산 및 병합
+    # (merge로 정렬이 흐트러지지만 바로 아래 4번에서 재정렬됨)
+    logger.info("RS Line MA Stack(정배열) 계산 및 병합 중")
+    ma_stack_df = calc_rs_line_ma_stack(prices, benchmark=benchmark)
+    rs_df = pd.merge(rs_df, ma_stack_df, on=["date", "ticker"], how="left")
+
     # 4. RS 기울기 계산
     logger.info("RS Line Slope(기울기) 계산 중 (기간: 20일, 기준: RS Line)")
     rs_df = rs_df.sort_values(['ticker', 'date'])
@@ -963,7 +1056,8 @@ def run_pipeline(config: Dict[str, Any]) -> None:
     # date, ticker, rs_score, rs_line,
     # rs_slope, rs_rank, rs_percentile,
     # rs_line_ema21, rs_line_phase,
-    # rs_1m, rs_3m, price_chg_pct, price_chg_5d_pct
+    # rs_line_sma20, rs_line_sma50, rs_line_ma_stack, rs_line_stack_days,
+    # rs_1m, rs_3m, rs_1m_pct, rs_3m_pct, price_chg_pct, price_chg_5d_pct
     rs_df.to_parquet(output_dir / "rs_full.parquet", index=False)
     
     logger.info("=== RS 엔진 전처리 완료 ===")

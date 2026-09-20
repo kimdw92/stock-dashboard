@@ -1,18 +1,20 @@
 {
-  "screener_pct_slider": 90,
-  "screener_3m_rs_pct_min": 90,
-  "screener_1m_rs_pct_min": 90,
-  "screener_rs_pct_filter_mode": "OR",
+  "screener_pct_slider": 80,
+  "screener_3m_rs_pct_min": 85,
+  "screener_1m_rs_pct_min": 75,
+  "screener_rs_pct_filter_mode": "AND",
   "screener_slope_chk": false,
-  "screener_phase_filter": [
-    "강세"
+  "screener_phase_filter": [],
+  "screener_ma_stack_filter": [
+    "정배열"
   ],
+  "screener_stack_days_min": 0,
   "screener_etf_only": false,
   "screener_price_min": 7.0,
   "screener_adv_min": 10.0,
   "screener_mktcap_min": 2.0,
   "screener_atr_pct_min": 3.0,
-  "screener_atr_multiple_max": 7.0,
+  "screener_atr_multiple_max": 5.0,
   "screener_ind_rank_max": 40,
   "screener_sort_by": "RS Percentile"
 }

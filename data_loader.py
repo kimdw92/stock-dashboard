@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import time
+import zlib
 from datetime import datetime, time as dt_time
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -56,17 +57,44 @@ STALE_MISS_LIMIT = 3
 # (같은 실측: 상승 점프 173건의 거래량비 중앙값은 12.6배. 스플릿 의심군은 1.0 미만에
 #  몰려 있고 그 사이 구간이 비어 있어, 1.0이 두 분포의 골에 해당한다.)
 #
-# 감지 대상은 상승 점프(리버스 스플릿)로 한정한다. 정방향 분할도 원리상 RS를 왜곡하지만
-# (가격 1/N → 폭락처럼 보임), 이 캐시에는 표본이 없어 임계값을 맞출 수가 없다. 실측한
-# 하락 점프 153건은 전부 달러 거래량이 함께 붕괴(비율 0.01~0.6)한 마이크로캡 실제 폭락으로,
-# 달러 거래량이 보존(≈1)되는 분할 서명과 다르다. 근거 없는 규칙을 넣으면 죽어가는 종목만
-# 매번 재다운로드하게 된다. 피해 규모도 비대칭이다 — 리버스 스플릿은 점수를 부풀려 상위
-# 순위를 오염시키지만, 정방향 분할은 좋은 종목 하나를 가릴 뿐 남의 순위를 밀어내지 않는다.
+# 이 블록이 다루는 것은 상승 점프(리버스 스플릿)뿐이고, 정방향 분할은 바로 아래 블록이
+# 맡는다. 원래는 "이 캐시에 하락 점프 표본이 전부 실제 폭락이라 임계값을 맞출 수 없다"는
+# 이유로 정방향을 감지 대상에서 뺐었는데, 이후 CRWD 4:1 사례가 나오면서 달러 거래량
+# 보존이라는 판정 근거가 생겨 추가했다.
+# 다만 피해 규모의 비대칭은 그대로다 — 리버스 스플릿은 점수를 부풀려 상위 순위를
+# 오염시키지만, 정방향 분할은 좋은 종목 하나를 가릴 뿐 남의 순위를 밀어내지 않는다.
 SPLIT_JUMP_RATIO = 3.0       # 하루 만에 이 배수 이상 오르면 점프 후보
 SPLIT_VOL_RATIO_MAX = 1.0    # 점프 후/전 거래량 중앙값 비율이 이 값 미만이면 스플릿 판정
 SPLIT_VOL_WINDOW = 10        # 거래량 비교 구간(거래일)
 SPLIT_SCAN_LOOKBACK = 252    # 스캔 범위 = RS 최장 창(252일). 그보다 과거의 스플릿은
                              # 계산 구간이 전부 조정 후 스케일이라 왜곡을 일으키지 않는다.
+# 정본 분할 이력 대조(_yf_actual_split_dates)에 받아올 히스토리 길이. 대조 대상 점프는
+# SPLIT_SCAN_LOOKBACK(252거래일 ≈ 1년) 안에만 있으므로 2년이면 여유가 충분하다.
+SPLIT_HISTORY_PERIOD = "2y"
+# ── 미조정 정방향 분할(액면분할) 감지 ────────────────────────────────────────
+# 정방향 분할은 주식 수를 N배로 늘려 가격을 1/N로 낮춘다. 리버스와 마찬가지로 증분
+# append 구조에서는 분할 이전 저장 행이 옛 고가 스케일로 남아, 새 저가 행과의 이음매가
+# 하루 -70%대 폭락처럼 보인다. RS Score는 이 이음매를 그대로 수익률로 읽어, 실제로는
+# 견조한 종목을 최하위로 처박는다.
+# (2026-06-26 캐시 실측: CRWD가 4:1 분할로 $678.65 → $175.27. 야후 정본은 $169.66로
+#  전 구간이 조정돼 있어, 전체 재다운로드만으로 이음매가 사라진다.)
+#
+# 대개 야후는 정방향 분할을 정확히 인지해 재다운로드만으로 정본을 주지만, 일부
+# ETF/ADR은 원본 자체가 미조정이라 재다운로드로도 이음매가 남는다. 그래서 리버스와
+# 동일하게 재다운로드를 먼저 시도하고, 그래도 남으면 소급 보정(back-adjust)까지 간다.
+# 오탐(실제 폭락)을 back-adjust하면 폭락을 평탄화하는 위험이 있으나, 아래 달러 거래량
+# 보존 게이트가 폭락을 걸러내고 splitfix 기록이 재플래그를 막는다.
+#
+# 실제 폭락과의 구분은 달러 거래량(가격×거래량)이다. 정방향 분할은 주식 수가 정확히
+# 배수만큼 늘어 달러 거래량이 보존(≈1)되지만, 진짜 폭락은 시가총액이 증발해 달러
+# 거래량이 붕괴한다.
+# (2026-08-05 캐시 실측: 하락 점프 151건 중 마이크로캡 폭락 대다수는 달러거래량비
+#  0.01~0.4에 몰려 있고, CRWD는 0.93. 분할 배수도 3~10:1로 한정한다 — 1:20 이상은
+#  진짜 분할이 아니라 거래량이 폭증한 폭락이며 그쪽은 배수 하한이 걸러낸다.)
+FORWARD_SPLIT_PRICE_RATIO_MAX = 1.0 / SPLIT_JUMP_RATIO  # 가격이 1/3 이하로 하락하면 점프 후보
+FORWARD_SPLIT_PRICE_RATIO_MIN = 0.10   # 1/10 미만(초고배수)은 분할 아닌 폭락으로 배제
+FORWARD_SPLIT_DV_RATIO_MIN = 0.5       # 점프 후/전 달러 거래량 비율 하한(보존 판정)
+FORWARD_SPLIT_DV_RATIO_MAX = 2.0       # 〃 상한 — 이 밖이면 시총 붕괴/폭증으로 보고 제외
 # ── 선제적 쿨다운(중간 휴식) ─────────────────────────────────────────────────
 # 야후의 제한은 "하루 총량 쿼터"가 아니라 짧은 윈도우의 속도 제한으로 보인다.
 # 근거(2026-07-29 실측): 누적 ~3,300건에서 차단됐으나 247초 대기 후 추가 2,100건이
@@ -87,7 +115,15 @@ SPLIT_SCAN_LOOKBACK = 252    # 스캔 범위 = RS 최장 창(252일). 그보다 
 # 그래도 막히면 아래쪽의 성공률 감지(RATE_LIMIT_*)가 240초 쿨다운 → 재시도 → 중단 순으로
 # 처리하고, 중단되더라도 "오래된 순" 정렬 덕분에 다음 실행이 밀린 티커부터 이어받는다.
 # 재시도도 실제 요청을 소모하므로 카운터는 시도 단위로 가산한다.
-REQUESTS_BEFORE_PAUSE = 2400
+#
+# 콜드/포스트-리스트 구분: 실측상 차단점이 다르다 — 콜드 스타트(실행 첫 윈도우)는 ~3,300건,
+# 휴식 이후 윈도우는 ~2,837건. 300초 휴식이 야후 카운터를 완전히 되돌리지 못하기 때문이다.
+# 그래서 첫 윈도우만 콜드 상한(~3,300)의 15% 마진인 2,800까지 허용하고, 휴식 이후부터는
+# 2,837 기준의 2,400을 쓴다. 균일하게 2,400을 쓰면 4,800건 규모에서 휴식이 2회 발생하지만,
+# 첫 윈도우를 2,800으로 올리면 콜드 상한이 강제하는 이론적 바닥인 1회로 줄어든다.
+# (초과해도 성공률 감지가 240초 쿨다운으로 graceful하게 처리하므로 리스크는 낮다.)
+REQUESTS_BEFORE_FIRST_PAUSE = 2800  # 콜드 첫 윈도우 임계(차단점 ~3,300의 15% 마진)
+REQUESTS_BEFORE_PAUSE = 2400        # 휴식 이후 윈도우 임계(차단점 ~2,837 기준)
 DOWNLOAD_PAUSE_SECONDS = 300.0
 # ── 유동성 하한(휴면 티커) ───────────────────────────────────────────────────
 # 유니버스 필터는 구조적 조건(티커 형식·워런트·우선주)만 걸러서, 일평균 거래대금이
@@ -112,6 +148,12 @@ DORMANT_REFRESH_PER_RUN = 250
 # 상한을 두고, 초과분은 다음 실행으로 이월한다. OHLCV(~6.5천 건)와 합산해도
 # IP 차단 임계 아래에 머물게 하는 것이 목적.
 INFO_FETCH_PER_RUN_CAP = 1500
+# 만료 기한 지터 비율. 캐시를 처음 채운 실행에서는 수천 개 항목의 updated_at이 같은
+# 날짜로 찍히므로, 고정 주기를 쓰면 max_age_days째에 전부 동시 만료돼 상한(1500)에
+# 걸린 채 여러 실행에 걸쳐 재수집이 몰린다(스탬피드). 티커별로 기한을 ±(주기 × 이 비율)
+# 만큼 흩어 만료를 고르게 분산시킨다. 주기에 비례하므로 90일(±30) / 30일(±10) 캐시가
+# 각각 자기 주기에 맞는 폭을 갖는다. 1/3이면 만료가 주기의 2/3 구간에 균등 분포한다.
+INFO_MAX_AGE_JITTER_RATIO = 1 / 3
 
 
 # yfinance 요청에 재사용할 curl_cffi 브라우저 임퍼소네이션 세션(모듈 전역 1개).
@@ -354,6 +396,25 @@ def _cap_fetch_list(primary: list[str], secondary: list[str], label: str,
     return to_fetch
 
 
+def _jittered_max_age(ticker: str, max_age_days: int, jitter_days: int | None = None) -> int:
+    """티커별 만료 기한을 [max_age_days - jitter, max_age_days + jitter]로 흩어 반환한다.
+
+    jitter_days=None이면 INFO_MAX_AGE_JITTER_RATIO로 주기에 비례해 정한다. 0을 주면
+    지터 없이 max_age_days를 그대로 쓴다.
+
+    티커 문자열의 CRC32를 오프셋으로 쓰므로 같은 티커는 항상 같은 기한을 갖는다
+    (실행마다 흔들리면 만료 판정이 요동쳐 재수집이 반복된다). 내장 hash()는 문자열에
+    대해 프로세스마다 시드가 바뀌므로 쓸 수 없다.
+    """
+    if jitter_days is None:
+        jitter_days = round(max_age_days * INFO_MAX_AGE_JITTER_RATIO)
+    if jitter_days <= 0:
+        return max_age_days
+    span = 2 * jitter_days + 1
+    offset = zlib.crc32(ticker.encode()) % span - jitter_days
+    return max(1, max_age_days + offset)
+
+
 def _fetch_single_sector_industry(ticker: str, retries: int = 2) -> dict[str, str] | None:
     """단일 티커의 sector/industry를 yfinance에서 조회한다.
 
@@ -385,13 +446,15 @@ def fetch_sector_industry_map(
     force_update: bool = False,
     max_age_days: int = 90,
     empty_retry_days: int = 3,
+    jitter_days: int | None = None,
 ) -> dict[str, dict[str, str]]:
     """
     모든 종목의 sector/industry 메타데이터를 yfinance에서 수집해 로컬 캐시에 저장한다.
 
     야후 파이낸스 차단을 피하기 위해 전체 재수집은 피하되, 다음 경우는 증분 수집한다:
       1) 캐시에 없는 신규 티커 (유니버스 편입 종목)
-      2) 정상 수집된 티커의 갱신일이 max_age_days를 초과한 경우
+      2) 정상 수집된 티커의 갱신일이 max_age_days(±jitter_days)를 초과한 경우
+         — 기한은 티커별로 흩어져 있다. _jittered_max_age() 참고.
       3) 차단/오류로 값이 비어 있는 티커(status != "ok")의 갱신일이
          empty_retry_days를 초과한 경우 — 차단으로 빈 값이 영구화되지 않도록
          짧은 주기로 재시도한다. (status="ok"인 진짜 데이터 없는 종목은 재시도 안 함)
@@ -416,7 +479,6 @@ def fetch_sector_industry_map(
         print(f"  [Sector] force_update=True → 전체 {len(to_fetch):,}개 종목 재수집")
     else:
         now = pd.Timestamp.now().normalize()
-        stale_cutoff = now - pd.Timedelta(days=max_age_days)
         empty_retry_cutoff = now - pd.Timedelta(days=empty_retry_days)
         primary = []      # (1) 신규 + (2) 만료 — 우선 수집
         retry_empty = []  # (3) 빈 값 재시도 — 남는 예산으로 수집
@@ -428,8 +490,10 @@ def fetch_sector_industry_map(
             updated = pd.to_datetime(entry.get("updated_at"), errors="coerce")
             has_value = bool(entry.get("sector") or entry.get("industry"))
             if has_value or entry.get("status") == "ok":
-                # 값이 있거나, 정상 수집됐지만 진짜 데이터가 없는 종목 → 장기 주기
-                if pd.isna(updated) or updated < stale_cutoff:
+                # 값이 있거나, 정상 수집됐지만 진짜 데이터가 없는 종목 → 장기 주기.
+                # 기한은 티커별 지터로 흩어 동시 만료(스탬피드)를 막는다.
+                if pd.isna(updated) or (now - updated).days >= _jittered_max_age(
+                        t, max_age_days, jitter_days):
                     primary.append(t)                    # (2) 오래된 티커
             else:
                 # 차단/오류로 빈 값(status="failed" 또는 레거시 무status) → 단기 재시도
@@ -610,14 +674,21 @@ def _write_stale_misses(cache_path: Path, misses: dict[str, int]) -> None:
 
 
 # ── 스플릿 보수 기록 ──────────────────────────────────────────────────────────
-# 점프 하나를 어디까지 처리했는지 단계로 기록한다. {티커: {"jump": 날짜, "stage": 단계}}
+# 점프 하나를 어디까지 처리했는지 단계로 기록한다.
+# 형식: {티커: [{"jump": 날짜, "stage": 단계}, ...]} — 한 티커가 상승·하락 점프를 동시에
+# 가질 수 있어 점프별 레코드를 리스트로 담는다.
 #   redownloaded : 전체 기간을 다시 받아봤다 (야후가 스플릿을 알면 여기서 해결된다)
 #   adjusted     : 재다운로드로도 안 고쳐져 우리가 직접 소급 보정했다
+#   rejected     : 야후 정본 분할 이력에 없어 실제 급변으로 판정, 보정을 거부했다(최종 상태)
 #
-# 두 단계로 나누는 이유는 순서가 중요해서다. 야후가 스플릿을 인지한 경우 재다운로드가
+# 단계를 나누는 이유는 순서가 중요해서다. 야후가 스플릿을 인지한 경우 재다운로드가
 # 정본 데이터를 주므로 항상 먼저 시도하고, 그래도 점프가 남을 때만 자체 보정으로 넘어간다.
 # (2026-08-03 실측: 재다운로드한 46종목 중 23종목만 해결됐다. 나머지 23종목은 야후 원본
 #  자체가 미조정이라 몇 번을 다시 받아도 같은 점프가 돌아온다.)
+# 보정 직전에는 정본 분할 이력과 대조해 진짜 분할일 때만 진행한다. 야후가 가격을 소급
+# 조정하지 않은 티커라도 액션 이력에는 분할이 남으므로 이 대조가 성립한다.
+# (2026-08-13 실측: 'adjusted' 9종목 전부 점프일 ±5일 안에 정본 분할 기록이 있었고,
+#  'rejected' 표본은 대부분 이력이 아예 없거나 점프와 무관한 과거 분할뿐이었다.)
 #
 # 기록은 무한 루프 방지 역할도 겸한다. 같은 점프를 이미 처리했으면 다시 플래그하지 않으므로,
 # 거래량까지 줄어든 진짜 급등이 매 실행 재다운로드를 반복하는 일이 없다.
@@ -638,38 +709,116 @@ def _same_jump(a: str, b: str) -> bool:
         return a == b
 
 
+def _find_jump(recs: list[dict[str, str]], jump: str) -> dict[str, str] | None:
+    """recs에서 같은 점프(±SPLIT_JUMP_MATCH_DAYS)를 가리키는 레코드를 찾는다."""
+    for rec in recs:
+        if _same_jump(rec.get("jump", ""), jump):
+            return rec
+    return None
+
+
+def _merge_splitfix(
+    base: dict[str, list[dict[str, str]]],
+    updates: dict[str, list[dict[str, str]]],
+) -> dict[str, list[dict[str, str]]]:
+    """티커별 점프 기록을 병합한다.
+
+    같은 점프(±SPLIT_JUMP_MATCH_DAYS)는 한 레코드로 합치되 상위 단계가 이긴다:
+    'redownloaded' < 'adjusted' < 'rejected'. 소급 보정은 재다운로드의 후속 단계이고,
+    'rejected'(정본 분할 이력과 불일치해 보정 거부한 실제 폭락·급등)는 최종 상태라
+    재관측돼도 강등되지 않아야 재플래그가 영구히 막힌다. 서로 다른 점프(예: 한
+    티커의 상승·하락 점프)는 각각 별개 레코드로 유지한다.
+    """
+    _rank = {"redownloaded": 0, "adjusted": 1, "rejected": 2}
+    out: dict[str, list[dict[str, str]]] = {
+        t: [dict(r) for r in recs] for t, recs in base.items()
+    }
+    for t, recs in updates.items():
+        cur = out.setdefault(t, [])
+        for rec in recs:
+            hit = _find_jump(cur, rec["jump"])
+            if hit is None:
+                cur.append(dict(rec))
+            elif _rank.get(rec["stage"], 0) >= _rank.get(hit.get("stage", ""), 0):
+                hit["stage"] = rec["stage"]
+                hit["jump"] = rec["jump"]  # 재관측된 점프일로 갱신(±5일 밀림 흡수)
+    return out
+
+
 def _splitfix_path(cache_path: Path) -> Path:
     """마스터 캐시 옆 스플릿 보수 기록 파일 경로."""
     return cache_path.with_name(cache_path.stem + ".splitfix.json")
 
 
-def _read_splitfix(cache_path: Path) -> dict[str, dict[str, str]]:
-    """{티커: {"jump": 'YYYY-MM-DD', "stage": ...}}. 없거나 실패 시 빈 dict.
+def _read_splitfix(cache_path: Path) -> dict[str, list[dict[str, str]]]:
+    """{티커: [{"jump": 'YYYY-MM-DD', "stage": ...}, ...]}. 없거나 실패 시 빈 dict.
 
-    구버전 포맷({티커: 날짜문자열})은 재다운로드까지 마친 상태로 읽는다.
+    한 티커가 상승(리버스)·하락(정방향) 점프를 동시에 가질 수 있어 점프별 레코드를
+    리스트로 담는다. 구버전 포맷도 하위호환으로 읽는다:
+      - {티커: 날짜문자열}          → [{jump, stage="redownloaded"}]  (최초 버전)
+      - {티커: {"jump","stage"}}    → [그 레코드]                     (단일-레코드 버전)
     """
     data = _read_json(_splitfix_path(cache_path)) or {}
-    out: dict[str, dict[str, str]] = {}
+    out: dict[str, list[dict[str, str]]] = {}
     try:
         for k, v in (data.get("repaired") or {}).items():
-            if isinstance(v, dict):
-                jump, stage = str(v.get("jump", "")), str(v.get("stage", "redownloaded"))
-            else:  # 구버전: 날짜 문자열만 저장했고, 그 시점 동작은 재다운로드였다
-                jump, stage = str(v), "redownloaded"
-            if jump:
-                out[str(k)] = {"jump": jump, "stage": stage}
+            recs: list[dict[str, str]] = []
+            for it in (v if isinstance(v, list) else [v]):
+                if isinstance(it, dict):
+                    jump, stage = str(it.get("jump", "")), str(it.get("stage", "redownloaded"))
+                else:  # 구버전: 날짜 문자열만 저장했고, 그 시점 동작은 재다운로드였다
+                    jump, stage = str(it), "redownloaded"
+                if jump:
+                    recs.append({"jump": jump, "stage": stage})
+            if recs:
+                out[str(k)] = recs
     except Exception:
         return {}
     return out
 
 
-def _write_splitfix(cache_path: Path, repaired: dict[str, dict[str, str]]) -> None:
+def _write_splitfix(cache_path: Path, repaired: dict[str, list[dict[str, str]]]) -> None:
     """스플릿 보수 기록 저장 (원자적 쓰기, 실패는 무해하게 무시)."""
     _write_json_atomic(
         _splitfix_path(cache_path),
         {"updated": pd.Timestamp.now().strftime("%Y-%m-%d"), "repaired": repaired},
         "스플릿 보수 기록",
     )
+
+
+def _yf_actual_split_dates(ticker: str) -> pd.DatetimeIndex | None:
+    """야후가 기록한 실제 분할(정본 corporate action)의 발생일들.
+
+    소급 보정 전 진위 확인용이다. 관측된 점프가 진짜 분할이면 야후 액션 이력에 같은
+    날짜(±SPLIT_JUMP_MATCH_DAYS)가 있고, 실제 폭락·급등이면 없다. 야후가 가격 시계열을
+    소급 조정하지 않은 티커라도 액션 이력에는 분할이 남아 있어 이 대조가 성립한다.
+    (2026-08-13 실측: 소급 보정된 9종목 전부 점프일 ±5일 안에 정본 분할 기록이 있었다.)
+
+    Ticker.splits가 아니라 history()로 조회하는 이유는 실패를 구분하기 위해서다.
+    yfinance는 조회 실패(레이트리밋·상장폐지)를 예외로 던지지 않고 조용히 삼키므로
+    (hide_exceptions 기본값 True), 그 경우 .splits는 '분할 없음'과 똑같이 생긴 None을
+    반환한다. history()는 실패 시 빈 프레임을 주므로 봉이 실제로 왔는지로 성패를
+    가를 수 있다. period도 "max"가 아닌 SPLIT_HISTORY_PERIOD면 충분하다 — 대조 대상
+    점프는 캐시 스캔 범위(SPLIT_SCAN_LOOKBACK) 안에만 있다.
+
+    Returns:
+        분할 발생일 인덱스(tz 제거). 조회 실패 시 None(=확인 불가). 실패를 '분할
+        없음'으로 단정하면 진짜 미조정 분할을 오탐으로 버려 시계열을 되레 망가뜨리므로,
+        호출부는 None을 '이번 회차 보정 보류'로 다뤄 다음 실행에서 재시도하게 한다.
+    """
+    try:
+        hist = yf.Ticker(ticker, session=_get_yf_session()).history(
+            period=SPLIT_HISTORY_PERIOD, interval="1d", actions=True,
+        )
+    except Exception:
+        return None
+    # 실패 응답은 빈 프레임이고 액션 컬럼 자체가 없다 → 확인 불가(None).
+    if hist is None or hist.empty or "Stock Splits" not in hist.columns:
+        return None
+    idx = pd.DatetimeIndex(hist.index[hist["Stock Splits"].fillna(0) != 0])
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    return idx
 
 
 def _backadjust_split(
@@ -679,13 +828,15 @@ def _backadjust_split(
 ) -> float | None:
     """점프 이전 구간을 소급 보정해 시계열 스케일을 잇는다(제자리 수정).
 
-    야후가 스플릿을 인지하지 못해 재다운로드로도 고쳐지지 않는 티커의 최후 수단이다.
-    yfinance의 back-adjust와 같은 방향으로, 점프 배수 R을 과거 가격에 곱하고 과거
-    거래량은 나눈다(분할 전에는 주식 수가 R배 많았으므로).
+    야후가 스플릿을 인지하지 못해 재다운로드로도 고쳐지지 않는 티커의 최후 수단이며,
+    상승(리버스)·하락(정방향) 점프 양방향을 모두 처리한다. yfinance의 back-adjust와 같은
+    방향으로, 점프 배수 R을 과거 가격에 곱하고 과거 거래량은 나눈다. 이 식은 방향과
+    무관하게 성립한다 — 리버스는 R>=3(과거를 키움), 정방향은 R<=1/3(과거를 줄임)이고,
+    거래량은 어느 쪽이든 분할 전 주식 수가 R배였다는 관계로 /R이 맞다.
 
     R은 실제 분할비(1:10 등)가 아니라 이음매의 관측 배수라, 그날의 진짜 등락분까지
-    함께 흡수해 하루치 수익률이 0에 가까워진다. 9배짜리 가짜 점프를 남겨두는 것에
-    비하면 무시할 수 있는 오차다.
+    함께 흡수해 하루치 수익률이 0에 가까워진다. 가짜 점프를 남겨두는 것에 비하면
+    무시할 수 있는 오차다.
 
     Returns:
         적용한 배수 R. 대상 행/값이 부적합해 보정하지 않았으면 None.
@@ -704,7 +855,9 @@ def _backadjust_split(
     if not (np.isfinite(cur) and np.isfinite(prev)) or prev <= 0 or cur <= 0:
         return None
     ratio = float(cur) / float(prev)
-    if ratio < SPLIT_JUMP_RATIO:  # 이미 보정됐거나 점프가 아니다
+    is_up = ratio >= SPLIT_JUMP_RATIO                                    # 리버스 스플릿(상승 점프)
+    is_down = FORWARD_SPLIT_PRICE_RATIO_MIN <= ratio <= FORWARD_SPLIT_PRICE_RATIO_MAX  # 정방향 분할(하락 점프)
+    if not (is_up or is_down):  # 이미 보정됐거나 점프가 아니다
         return None
 
     for key in ("close", "high", "low"):
@@ -758,7 +911,7 @@ def _detect_split_artifacts(
     cached_close: pd.DataFrame,
     cached_volume: pd.DataFrame | None,
     tickers: list[str],
-    repaired: dict[str, str],
+    repaired: dict[str, list[dict[str, str]]],
 ) -> dict[str, str]:
     """캐시에서 미조정 리버스 스플릿으로 보이는 가격 점프를 찾는다.
 
@@ -770,7 +923,7 @@ def _detect_split_artifacts(
         cached_close: 캐시 종가 (DatetimeIndex × 티커)
         cached_volume: 캐시 거래량. None/빈 프레임이면 감지를 건너뛴다.
         tickers: 이번 실행에서 다룰 티커 (이 중에서만 찾는다)
-        repaired: 이미 처리한 {티커: {"jump": 날짜, ...}} — 같은 점프일이면 제외.
+        repaired: 이미 처리한 {티커: [{"jump": 날짜, ...}, ...]} — 같은 점프일이면 제외.
             날짜 비교가 아니라 일치 여부로 거른다. 최근 점프를 보정하고 나면 그보다
             과거의 미조정 스플릿이 드러나는데, 부등호로 거르면 그 층을 영영 못 잡는다.
 
@@ -833,7 +986,99 @@ def _detect_split_artifacts(
 
     # 이미 처리한 점프는 제외 (재다운로드로도 못 고쳤고 보정까지 끝난 건 = 더 볼 일 없음)
     return {t: d for t, d in found.items()
-            if not _same_jump((repaired.get(t) or {}).get("jump", ""), d)}
+            if _find_jump(repaired.get(t) or [], d) is None}
+
+
+def _detect_forward_splits(
+    cached_close: pd.DataFrame,
+    cached_volume: pd.DataFrame | None,
+    tickers: list[str],
+    repaired: dict[str, list[dict[str, str]]],
+) -> dict[str, str]:
+    """캐시에서 미조정 정방향 분할(액면분할)로 보이는 하락 점프를 찾는다.
+
+    판정: 하루 가격비가 [FORWARD_SPLIT_PRICE_RATIO_MIN, MAX] 구간(3:1~10:1 분할)이면서,
+    점프 전후 달러 거래량(가격×거래량) 중앙값 비율이 1 근방([DV_MIN, DV_MAX])인 경우.
+    달러 거래량이 붕괴(<MIN)하거나 폭증(>MAX)하면 분할이 아닌 실제 사건으로 보고 제외한다.
+    거래량이 스플릿과 실제 급락을 가르는 유일한 신호라, 거래량 캐시가 없으면 판정을 포기한다.
+
+    잡은 티커는 우선 need_full로 전체 재다운로드한다 — 야후가 스플릿을 인지한 경우
+    여기서 정본으로 교체돼 해결된다. 그래도 이음매가 남으면(야후 원본 자체가 미조정)
+    리버스와 동일하게 소급 보정(back-adjust)으로 넘어간다. 달러 거래량 보존 게이트가
+    1차로 실제 폭락을 걸러내고, 파괴적인 back-adjust 직전에는 야후 정본 분할 이력
+    대조(_yf_actual_split_dates)가 최종 게이트로 오탐 평탄화를 막는다.
+    [_detect_split_artifacts](리버스, 상승 점프)와 방향·거래량 기준이 반대라 분리했다.
+
+    Args:
+        cached_close: 캐시 종가 (DatetimeIndex × 티커)
+        cached_volume: 캐시 거래량. None/빈 프레임이면 감지를 건너뛴다.
+        tickers: 이번 실행에서 다룰 티커 (이 중에서만 찾는다)
+        repaired: 이미 처리한 {티커: [{"jump": 날짜, ...}, ...]} — 같은 점프일이면 제외.
+
+    Returns:
+        {티커: 가장 최근 정방향 분할 의심 점프일 'YYYY-MM-DD'}
+    """
+    if cached_volume is None or cached_volume.empty or cached_close.empty:
+        return {}
+
+    cols = [t for t in tickers if t in cached_close.columns and t in cached_volume.columns]
+    if not cols:
+        return {}
+
+    # shift(1) 비교를 위해 스캔 범위보다 한 행 더 확보
+    close = cached_close[cols].tail(SPLIT_SCAN_LOOKBACK + 1)
+    volume = cached_volume[cols].reindex(close.index)
+    if len(close) < SPLIT_VOL_WINDOW + 2:
+        return {}
+
+    # 0은 "거래 없음/미수신"이지 실제 값이 아니다 → NaN으로 돌려 비율에서 제외
+    px = close.to_numpy(dtype="float64", copy=True)
+    vol = volume.to_numpy(dtype="float64", copy=True)
+    px[~(px > 0)] = np.nan
+    vol[~(vol > 0)] = np.nan
+    dollar = px * vol  # 달러 거래량 (NaN 전파)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = px[1:] / px[:-1]
+    hit = (
+        np.isfinite(ratio)
+        & (ratio <= FORWARD_SPLIT_PRICE_RATIO_MAX)
+        & (ratio >= FORWARD_SPLIT_PRICE_RATIO_MIN)
+    )
+    if not hit.any():
+        return {}
+
+    n_rows = px.shape[0]
+    dates = close.index
+    W = SPLIT_VOL_WINDOW
+    found: dict[str, str] = {}
+
+    # 점프는 전체의 극소수라 후보 좌표만 순회한다(전수 루프 회피)
+    for r, ci in zip(*np.nonzero(hit)):
+        i = r + 1  # ratio[r] = px[r+1]/px[r] 이므로 점프가 찍힌 날은 종가 행 r+1
+        ticker = cols[ci]
+        jump_day = dates[i].strftime("%Y-%m-%d")
+        # 더 최근 점프를 이미 찾았으면 갱신할 필요 없음
+        if found.get(ticker, "") >= jump_day:
+            continue
+
+        before = dollar[max(0, i - W):i, ci]
+        after = dollar[i:min(n_rows, i + W), ci]
+        before = before[np.isfinite(before)]
+        after = after[np.isfinite(after)]
+        # 리버스와 동일: 점프 직후 1개만 있어도 판정(방금 일어난 분할이 가장 시급)
+        if len(before) < 3 or len(after) < 1:
+            continue
+        base = float(np.median(before))
+        if base <= 0:
+            continue
+        dv_ratio = float(np.median(after)) / base
+        if FORWARD_SPLIT_DV_RATIO_MIN <= dv_ratio <= FORWARD_SPLIT_DV_RATIO_MAX:
+            found[ticker] = jump_day
+
+    # 이미 처리한(재다운로드해 본) 점프는 제외 — 오탐(실제 폭락)이 매 실행 재다운로드되는 것 방지
+    return {t: d for t, d in found.items()
+            if _find_jump(repaired.get(t) or [], d) is None}
 
 
 def _tail_slice(close_df, high_df, low_df, volume_df, min_rows: int = 300, max_rows: int = 340):
@@ -926,11 +1171,14 @@ def download_ohlcv(
         if need_full:
             print(f"  [Detect] 신규/데이터 부족 {len(need_full)}개 티커 → 전체 기간({period}) 재다운로드")
 
-    # ── 미조정 스플릿 티커 감지 ───────────────────────────────────────────────
+    # ── 미조정 스플릿 티커 감지 (리버스=상승 점프 / 정방향=하락 점프) ──────────
     # 증분 append로는 스플릿 이전 행의 가격 스케일을 고칠 수 없다. 전체 기간을 다시
     # 받으면 yfinance가 시계열 전체를 조정해 주므로 need_full에 편입한다.
+    # 리버스(split_hits)·정방향(fwd_hits) 모두 재다운로드를 먼저 하고, 그래도 이음매가
+    # 남으면 다음 실행에서 소급 보정까지 간다(_backadjust_split은 양방향 처리).
     split_hits: dict[str, str] = {}
-    split_repaired: dict[str, dict[str, str]] = {}
+    fwd_hits: dict[str, str] = {}
+    split_repaired: dict[str, list[dict[str, str]]] = {}
     if is_incremental and cached_close is not None:
         split_repaired = _read_splitfix(cache_path)
         split_hits = _detect_split_artifacts(
@@ -941,8 +1189,20 @@ def download_ohlcv(
         if newly:
             need_full.update(newly.keys())
             _preview = ", ".join(f"{t}({d})" for t, d in sorted(newly.items())[:5])
-            print(f"  [Split] 미조정 스플릿 의심 {len(newly)}개 티커 → 전체 기간({period}) "
+            print(f"  [Split] 미조정 리버스 스플릿 의심 {len(newly)}개 티커 → 전체 기간({period}) "
                   f"재다운로드: {_preview}{' ...' if len(newly) > 5 else ''}")
+
+        # 정방향 분할: 하락 점프 + 달러 거래량 보존. 우선 need_full(재다운로드),
+        # 남으면 다음 실행에서 소급 보정.
+        fwd_hits = _detect_forward_splits(
+            cached_close, cached_volume, yf_tickers, split_repaired
+        )
+        newly_fwd = {t: d for t, d in fwd_hits.items() if t not in need_full}
+        if newly_fwd:
+            need_full.update(newly_fwd.keys())
+            _pv = ", ".join(f"{t}({d})" for t, d in sorted(newly_fwd.items())[:5])
+            print(f"  [Split] 미조정 정방향 분할 의심 {len(newly_fwd)}개 티커 → 전체 기간({period}) "
+                  f"재다운로드: {_pv}{' ...' if len(newly_fwd) > 5 else ''}")
 
     close_frames, high_frames, low_frames, volume_frames = [], [], [], []
     rate_limit_abort = False  # 레이트리밋 지속 시 남은 배치 전체 중단 플래그
@@ -1000,7 +1260,11 @@ def download_ohlcv(
             # 선제적 휴식: 이 배치를 보내면 차단 임계에 근접하는 경우, 429를 맞고
             # 회복을 기다리는 대신 미리 쉬어 속도 윈도우를 비운다. 중단하지 않고
             # 계속 진행하므로 1회 실행으로 전체 유니버스를 커버한다.
-            if requests_since_pause + len(chunk) > REQUESTS_BEFORE_PAUSE:
+            # 첫(콜드) 윈도우는 차단점이 높아(~3,300) 임계를 높게 잡고, 휴식 이후부터는
+            # 되돌림이 불완전해 낮아진 차단점(~2,837) 기준의 낮은 임계를 쓴다. pause_count는
+            # _run_chunks 호출(전체기간→증분) 간에도 유지되므로 "첫 윈도우"는 실행 전체 기준이다.
+            pause_threshold = REQUESTS_BEFORE_FIRST_PAUSE if pause_count == 0 else REQUESTS_BEFORE_PAUSE
+            if requests_since_pause + len(chunk) > pause_threshold:
                 pause_count += 1
                 remaining = sum(len(c) for c in chunk_list[idx - 1:])
                 print(f"  [Pause] 누적 {requests_since_pause:,}건 → 차단 예방을 위해 "
@@ -1171,7 +1435,7 @@ def download_ohlcv(
     if requests_total:
         print(f"  [Requests] 이번 실행 요청 {requests_total:,}건"
               f" (선제 휴식 {pause_count}회 × {DOWNLOAD_PAUSE_SECONDS:.0f}초"
-              f", 휴식 간격 {REQUESTS_BEFORE_PAUSE:,}건)")
+              f", 휴식 임계 첫 {REQUESTS_BEFORE_FIRST_PAUSE:,}/이후 {REQUESTS_BEFORE_PAUSE:,}건)")
 
     if not close_frames:
         if cached_close is not None:
@@ -1256,27 +1520,68 @@ def download_ohlcv(
 
         print(f"  [Merge] 캐시({len(cached_close)}행) + 신규({len(new_close_df)}행) -> 최종({len(close_df)}행)")
 
-        # ── 재다운로드로도 안 고쳐진 스플릿 → 소급 보정 ───────────────────────
+        # ── 재다운로드로도 안 고쳐진 스플릿 → 소급 보정 (상승·하락 양방향) ────────
         # 병합된(=이번에 받은 정본이 반영된) 프레임에서 다시 스캔한다. 여기 남아 있다는
         # 것은 야후 원본 자체가 미조정이라는 뜻이므로, 직접 이음매를 잇는다.
         _frames = {"close": close_df, "high": high_df, "low": low_df, "volume": volume_df}
-        _still = _detect_split_artifacts(close_df, volume_df, list(close_df.columns), {})
-        _adjusted: dict[str, tuple[str, float]] = {}
-        for _t, _d in _still.items():
-            _prev = split_repaired.get(_t) or {}
+        _cols = list(close_df.columns)
+        _still = _detect_split_artifacts(close_df, volume_df, _cols, {})
+        _still_fwd = _detect_forward_splits(close_df, volume_df, _cols, {})
+        _adjusted: list[tuple[str, str, float]] = []  # (티커, 점프일, 배수)
+        _rejected: list[tuple[str, str]] = []         # 정본 분할 이력과 불일치 → 보정 거부
+        _probe_used = 0      # 정본 이력 조회에 쓴 요청 수
+        _probe_deferred = 0  # 요청 예산 소진으로 보류한 티커 수
+        # 두 딕셔너리를 병합하지 않고 이어붙여 순회한다 — 한 티커가 상승·하락 점프를
+        # 동시에 가질 때 {**a, **b}로 합치면 한쪽이 소실되기 때문.
+        for _t, _d in [*_still.items(), *_still_fwd.items()]:
+            _rec = _find_jump(split_repaired.get(_t) or [], _d)
             # 전체 재다운로드를 이미 거친 같은 점프만 보정 대상. 처음 보는 점프는
             # 먼저 정본 데이터를 받아볼 기회를 준다(이번 회차 need_full이 그 역할).
-            if _prev.get("stage") != "redownloaded" or not _same_jump(_prev.get("jump", ""), _d):
+            if _rec is None or _rec.get("stage") != "redownloaded":
+                continue
+            # 소급 보정은 그날의 진짜 등락까지 평탄화하는 파괴적 연산이라, 야후 정본
+            # 분할 이력과 대조해 실제 분할일 때만 진행한다. 거래량 휴리스틱만으로는
+            # 고거래량 폭락(예: 임상 실패)을 미조정 분할로 오인해 폭락 자체를 지울 수
+            # 있다. 점프 근처에 실제 분할이 없으면 'rejected'로 확정 기록해 재플래그를
+            # 막고, 이력 조회 실패(None)면 확인 불가이므로 보류(다음 실행 재시도).
+            #
+            # 이 조회도 야후 요청 1건이라 예산에 가산한다. 여기는 대량 다운로드가 끝난
+            # 직후라 예산이 이미 임계 근처일 수 있는데, 그대로 쏘면 스로틀된 응답이
+            # 돌아오고 그게 곧 오판(→ 영구 'rejected')의 원인이 된다. 남은 예산 안에서만
+            # 조회하고 초과분은 보류한다 — 여기서 300초를 쉬느니 다음 실행에 넘기는 편이
+            # 낫다(기록이 'redownloaded'로 남아 다음 실행이 그대로 이어받는다).
+            _budget = REQUESTS_BEFORE_FIRST_PAUSE if pause_count == 0 else REQUESTS_BEFORE_PAUSE
+            if requests_since_pause + 1 > _budget:
+                _probe_deferred += 1
+                continue
+            requests_since_pause += 1
+            requests_total += 1
+            _probe_used += 1
+            _sp = _yf_actual_split_dates(_t)
+            if _sp is None:
+                continue
+            if not any(_same_jump(_d, s.strftime("%Y-%m-%d")) for s in _sp):
+                _rejected.append((_t, _d))
                 continue
             _r = _backadjust_split(_frames, _t, _d)
             if _r is not None:
-                _adjusted[_t] = (_d, _r)
+                _adjusted.append((_t, _d, _r))
         if _adjusted:
-            _ex = ", ".join(f"{t}(×{r:.1f})" for t, (_, r) in sorted(_adjusted.items())[:5])
+            _ex = ", ".join(f"{t}(×{r:.2f})" for t, _, r in sorted(_adjusted)[:5])
             print(f"  [Split] 야후 미조정 {len(_adjusted)}개 티커 소급 보정: {_ex}"
                   f"{' ...' if len(_adjusted) > 5 else ''}")
+        if _rejected:
+            _rx = ", ".join(f"{t}({d})" for t, d in sorted(_rejected)[:5])
+            print(f"  [Split] 정본 분할 이력 없음 → 실제 급변으로 판정, 보정 거부 "
+                  f"{len(_rejected)}개: {_rx}{' ...' if len(_rejected) > 5 else ''}")
+        if _probe_used or _probe_deferred:
+            print(f"  [Split] 정본 분할 이력 조회 {_probe_used}건 "
+                  f"(누적 요청 {requests_total:,}건, 휴식 이후 {requests_since_pause:,}건)"
+                  + (f" / 예산 소진으로 {_probe_deferred}개 보류 → 다음 실행 재시도"
+                     if _probe_deferred else ""))
     else:
-        _adjusted = {}
+        _adjusted = []
+        _rejected = []
         close_df, high_df, low_df, volume_df = new_close_df, new_high_df, new_low_df, new_volume_df
         print(f"  [Download] 신규 다운로드 완료 (캐시 없음)")
     
@@ -1299,20 +1604,43 @@ def download_ohlcv(
         master_cache = pd.concat([close_df_tagged, high_df_tagged, low_df_tagged, volume_df_tagged], axis=1)
         master_cache = master_cache.sort_index(axis=1)
         
-        master_cache.to_parquet(cache_path)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        try:
+            master_cache.to_parquet(tmp_path)
+            tmp_path.replace(cache_path)
+        except Exception:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+            raise
         print(f"  [Cache] 마스터 캐시 업데이트: {cache_path} ({len(master_cache)}행)")
 
-        # 스플릿 의심으로 재다운로드한 티커를 기록한다(저장 성공 시에만).
+        # 스플릿 의심으로 처리한 점프를 기록한다(저장 성공 시에만).
         # 진짜 스플릿이었다면 조정된 시계열로 교체돼 다음 실행에서 점프 자체가 사라지고,
-        # 거래량까지 줄어든 실제 급등이었다면 점프가 남지만 이 기록이 재플래그를 막는다.
-        _tried = {t: {"jump": d, "stage": "redownloaded"}
-                  for t, d in split_hits.items() if t in received}
-        _done = {t: {"jump": d, "stage": "adjusted"} for t, (d, _) in _adjusted.items()}
-        if _tried or _done:
-            _kept = {t: v for t, v in split_repaired.items() if t in cached_close.columns}
-            _write_splitfix(cache_path, {**_kept, **_tried, **_done})
-            if _tried:
-                print(f"  [Split] {len(_tried)}개 티커 전체 기간 재다운로드 완료 "
+        # 오탐(실제 급등/급락)이었다면 점프가 남지만 이 기록이 재플래그를 막는다.
+        # 리버스·정방향 모두 "redownloaded"로 기록하고, 재다운로드로도 남은 점프는 위에서
+        # 소급 보정돼 "adjusted"로 승격된다. 한 티커가 상승·하락 점프를 동시에 가질 수
+        # 있으므로 점프별 레코드를 리스트로 모아 병합한다({**a, **b}는 한쪽을 소실시킨다).
+        _updates: dict[str, list[dict[str, str]]] = {}
+        for t, d in [*split_hits.items(), *fwd_hits.items()]:
+            if t in received:
+                _updates.setdefault(t, []).append({"jump": d, "stage": "redownloaded"})
+        for t, d, _ in _adjusted:
+            _updates.setdefault(t, []).append({"jump": d, "stage": "adjusted"})
+        # 정본 분할 이력과 불일치해 보정을 거부한 점프 = 실제 급변. 'rejected'로 남겨
+        # 두면 stage!="redownloaded"라 다음 실행에서 재보정되지 않고, 감지 필터도
+        # 이미 기록된 점프를 제외하므로 매 실행 재다운로드가 반복되지 않는다.
+        for t, d in _rejected:
+            _updates.setdefault(t, []).append({"jump": d, "stage": "rejected"})
+        if _updates:
+            _kept = {t: recs for t, recs in split_repaired.items() if t in cached_close.columns}
+            _write_splitfix(cache_path, _merge_splitfix(_kept, _updates))
+            _n_tried = sum(1 for recs in _updates.values() for r in recs
+                           if r["stage"] == "redownloaded")
+            if _n_tried:
+                print(f"  [Split] {_n_tried}개 점프 전체 기간 재다운로드 완료 "
                       f"(다음 실행에서 미해결분은 소급 보정)")
 
         # 잠정 봉 마커 갱신: 저장된 최신일이 장중 캡처(미확정)면 마커 기록,
@@ -1350,29 +1678,68 @@ def download_ohlcv(
     print(f"  [Return] 최종 슬라이싱: {close_df.shape}")
     return close_df, high_df, low_df, volume_df
 
-def download_spy_close(period: str = "16mo") -> pd.Series:
-    print(f"  [Download] SPY 벤치마크 다운로드 (period={period})...")
-    raw = yf.download("SPY", period=period, progress=False, auto_adjust=True, session=_get_yf_session())
-    if raw is None or raw.empty:
-        # 레이트리밋 등 실패 시 ETF 마스터 캐시의 SPY 종가로 폴백한다.
-        # 빈 시리즈를 반환하면 spy_close.parquet이 0행으로 덮어써져 RS Line
-        # 벤치마크가 사라지므로, 캐시라도 반환해 하류 계산을 보호한다.
+def download_spy_close(
+    period: str = "16mo",
+    etf_close_df: pd.DataFrame | None = None,
+) -> pd.Series:
+    """SPY 벤치마크 종가를 반환한다.
+
+    1순위: 전달받은 etf_close_df에서 SPY 종가 추출 (네트워크 0건)
+    2순위: ETF 마스터 캐시(etf_ohlcv_master_cache.parquet)에서 SPY 종가 추출 (네트워크 0건)
+    3순위: .intermediate/etf_close.parquet에서 SPY 종가 추출 (네트워크 0건)
+    4순위: 야후 파이낸스 직접 다운로드 (최초 실행 등 캐시 부재 시 폴백)
+    """
+    # 1. 인자로 전달된 ETF 종가 DataFrame에서 추출
+    if etf_close_df is not None and not etf_close_df.empty and "SPY" in etf_close_df.columns:
+        spy = etf_close_df["SPY"].dropna()
+        if not spy.empty:
+            spy.index = pd.to_datetime(spy.index)
+            print(f"  [Extract] ETF 데이터에서 SPY 종가 추출 완료 ({len(spy)}행, 최신 {spy.index.max().date()})")
+            return spy.sort_index()
+
+    # 2. ETF 마스터 캐시에서 추출
+    etf_cache = _cache_path("etf_ohlcv_master_cache.parquet")
+    if etf_cache.exists():
         try:
-            m = pd.read_parquet(_cache_path("etf_ohlcv_master_cache.parquet"))
-            spy = m.xs("Close", level=1, axis=1)["SPY"].dropna()
-            if not spy.empty:
-                spy.index = pd.to_datetime(spy.index)
-                print(f"  [Fallback] SPY 다운로드 실패 → ETF 마스터 캐시의 SPY 사용 "
-                      f"({len(spy)}행, 최신 {spy.index.max().date()})")
-                return spy.sort_index()
+            m = pd.read_parquet(etf_cache)
+            close_cols = m.xs("Close", level=1, axis=1)
+            if "SPY" in close_cols.columns:
+                spy = close_cols["SPY"].dropna()
+                if not spy.empty:
+                    spy.index = pd.to_datetime(spy.index)
+                    print(f"  [Extract] ETF 마스터 캐시에서 SPY 종가 추출 완료 ({len(spy)}행, 최신 {spy.index.max().date()})")
+                    return spy.sort_index()
         except Exception as exc:
-            print(f"  [Warning] SPY 캐시 폴백 실패: {exc}")
-        return pd.Series(dtype=float)
-    close = raw["Close"] if isinstance(raw, pd.DataFrame) else raw
-    if isinstance(close, pd.DataFrame):
-        close = close.iloc[:, 0]
-    close.index = pd.to_datetime(close.index)
-    return close.sort_index()
+            print(f"  [Warning] ETF 마스터 캐시에서 SPY 추출 실패: {exc}")
+
+    # 3. .intermediate/etf_close.parquet에서 추출
+    intermediate_etf = Path(__file__).parent / ".intermediate" / "etf_close.parquet"
+    if intermediate_etf.exists():
+        try:
+            m = pd.read_parquet(intermediate_etf)
+            if "SPY" in m.columns:
+                spy = m["SPY"].dropna()
+                if not spy.empty:
+                    spy.index = pd.to_datetime(spy.index)
+                    print(f"  [Extract] etf_close.parquet에서 SPY 종가 추출 완료 ({len(spy)}행, 최신 {spy.index.max().date()})")
+                    return spy.sort_index()
+        except Exception as exc:
+            print(f"  [Warning] etf_close.parquet에서 SPY 추출 실패: {exc}")
+
+    # 4. 캐시/추출 실패 시 야후 파이낸스 직접 다운로드 폴백
+    print(f"  [Download] SPY 벤치마크 직접 다운로드 (period={period})...")
+    try:
+        raw = yf.download("SPY", period=period, progress=False, auto_adjust=True, session=_get_yf_session())
+        if raw is not None and not raw.empty:
+            close = raw["Close"] if isinstance(raw, pd.DataFrame) else raw
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close.index = pd.to_datetime(close.index)
+            return close.sort_index()
+    except Exception as exc:
+        print(f"  [Warning] SPY 직접 다운로드 실패: {exc}")
+
+    return pd.Series(dtype=float)
 
 
 def _download_url_content(url: str) -> bytes:
@@ -1545,22 +1912,62 @@ def _fetch_yfinance_etf_holdings(etf_ticker: str, limit: int, status: str) -> li
     return _records_from_holdings_table(table, etf_ticker, "yfinance", status, limit)
 
 
-def fetch_etf_top_holdings(etfs: pd.DataFrame | list[dict[str, object]] | list[str], limit: int = 10) -> pd.DataFrame:
+def fetch_etf_top_holdings(
+    etfs: pd.DataFrame | list[dict[str, object]] | list[str],
+    limit: int = 10,
+    prev: pd.DataFrame | None = None,
+    max_age_days: int = 30,
+) -> pd.DataFrame:
     """
     ETF별 상위 보유종목을 다운로드합니다.
 
     공식 holdings 파일이 지정된 ETF는 공식 파일을 먼저 시도하고, 실패하면 yfinance의
     top_holdings를 사용합니다.
+
+    나이 기반 스킵: 보유종목(특히 지수형 ETF의 상위 10종목)은 분기 리밸런싱이라 느리게
+    변하므로, prev 캐시의 AsOfDate가 max_age_days 이내면 재수집을 건너뛰고 그대로 재사용한다.
+    yfinance 경로 ETF는 OHLCV 다운로드와 같은 야후 레이트리밋 예산을 소모하므로, 매 실행
+    전체 재수집은 예산·시간 낭비다. (ensure_universe_files·fetch_sector_industry_map와 동일 패턴)
+
+    이번 수집이 실패한 ETF는 prev의 해당 행을 보존해 부분 실패가 기존 데이터를 지우지 않게 한다.
+    반환 프레임은 항상 완전하다(신선분 재사용 + 신규 수집 + 실패 폴백을 함께 담는다).
+
+    Args:
+        prev: 직전 실행의 보유종목 DataFrame(스킵·폴백 기준). None이면 전체 신규 수집.
+        max_age_days: 이 일수 이내로 신선한 ETF는 재수집을 생략한다.
     """
     if isinstance(etfs, pd.DataFrame):
         records = etfs.reset_index(drop=False).to_dict("records")
     else:
         records = [{"Ticker": etf} if isinstance(etf, str) else etf for etf in etfs]
 
+    # 이전 캐시에서 ETF별 보존 행과 최신 AsOfDate를 준비 (스킵 + 실패 폴백용).
+    prev_rows_by_etf: dict[str, list[dict[str, object]]] = {}
+    prev_asof_by_etf: dict[str, pd.Timestamp] = {}
+    if prev is not None and not prev.empty and "ETF" in prev.columns:
+        for etf_t, grp in prev.groupby("ETF"):
+            prev_rows_by_etf[str(etf_t)] = grp.to_dict("records")
+            if "AsOfDate" in grp.columns:
+                asof = pd.to_datetime(grp["AsOfDate"], errors="coerce").max()
+                if pd.notna(asof):
+                    prev_asof_by_etf[str(etf_t)] = asof
+    fresh_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=max_age_days)
+
     all_records: list[dict[str, object]] = []
+    reused_fresh = 0
     for idx, record in enumerate(records, start=1):
         etf_ticker = str(record.get("Ticker", "")).strip().upper()
         if not etf_ticker:
+            continue
+
+        # 나이 기반 스킵: 캐시가 max_age_days 이내로 신선하면 재수집 없이 그대로 재사용.
+        # (재사용 행은 원래 AsOfDate를 유지하므로 신선도 판정이 회차 간 정확히 이어진다.)
+        asof = prev_asof_by_etf.get(etf_ticker)
+        if asof is not None and asof >= fresh_cutoff and etf_ticker in prev_rows_by_etf:
+            # limit이 회차 간 낮아졌을 수 있으므로 재사용 행에도 절단을 재적용한다
+            # (신규 수집 경로의 rows[:limit]와 보유종목 수를 일치시킨다).
+            all_records.extend(prev_rows_by_etf[etf_ticker][:limit])
+            reused_fresh += 1
             continue
 
         print(f"  [ETF Holdings] {idx}/{len(records)} {etf_ticker} 상위 보유종목 수집...")
@@ -1584,8 +1991,18 @@ def fetch_etf_top_holdings(etfs: pd.DataFrame | list[dict[str, object]] | list[s
             else:
                 print(f"  [ETF Holdings] {etf_ticker}: no holdings found")
 
-        all_records.extend(rows[:limit])
+        if rows:
+            all_records.extend(rows[:limit])
+        elif etf_ticker in prev_rows_by_etf:
+            # 이번 수집 실패 → 이전 데이터 보존 (보유종목은 느리게 변하므로 안전).
+            # 재사용 경로와 동일하게 현재 limit으로 절단해 종목 수를 일치시킨다.
+            all_records.extend(prev_rows_by_etf[etf_ticker][:limit])
+            print(f"  [ETF Holdings] {etf_ticker}: 수집 실패, 이전 데이터 보존")
         time.sleep(random.uniform(0.2, 0.5))
+
+    if reused_fresh:
+        print(f"  [ETF Holdings] {reused_fresh}개 ETF는 {max_age_days}일 이내 신선 → "
+              f"재수집 생략(캐시 재사용)")
 
     columns = [
         "ETF",
@@ -1624,13 +2041,15 @@ def fetch_shares_outstanding(
     tickers: list[str],
     force_update: bool = False,
     max_age_days: int = 30,
+    jitter_days: int | None = None,
 ) -> pd.Series:
     """
     모든 종목의 발행 주식 수(Shares Outstanding)를 가져와 로컬 캐시에 저장합니다.
 
     야후 파이낸스 차단을 피하기 위해 전체 재수집은 피하되, 다음 두 경우는 증분 수집한다:
       1) 캐시에 없는 신규 티커 (유니버스 편입 종목)
-      2) 마지막 갱신일이 max_age_days를 초과한 오래된 티커
+      2) 마지막 갱신일이 max_age_days(±jitter_days)를 초과한 오래된 티커
+         — 기한은 티커별로 흩어져 있다. _jittered_max_age() 참고.
     force_update=True면 전체를 강제 재수집한다.
     """
     CACHE_PATH = Path(__file__).parent / ".cache" / "shares_outstanding_cache.parquet"
@@ -1659,19 +2078,21 @@ def fetch_shares_outstanding(
         to_fetch = unique_tickers
         print(f"  [Shares] force_update=True → 전체 {len(to_fetch):,}개 종목 재수집")
     else:
-        stale_cutoff = today - pd.Timedelta(days=max_age_days)
         updated_at = pd.to_datetime(cached_df.get("UpdatedAt"), errors="coerce")
         new_list = []    # (1) 신규 티커 — 우선 수집
         stale_list = []  # (2) 만료 티커 — 남는 예산으로 수집
         for t in unique_tickers:
             if t not in cached_df.index:
                 new_list.append(t)
-            elif pd.isna(updated_at.get(t)) or updated_at.get(t) < stale_cutoff:
+                continue
+            # 기한은 티커별 지터로 흩어 동시 만료(스탬피드)를 막는다.
+            u = updated_at.get(t)
+            if pd.isna(u) or (today - u).days >= _jittered_max_age(t, max_age_days, jitter_days):
                 stale_list.append(t)
-        # 실행당 상한: 30일 만료가 한꺼번에 도래해도 하루 요청량 폭증 방지 (초과분 이월)
+        # 실행당 상한: 만료가 한꺼번에 도래해도 하루 요청량 폭증 방지 (초과분 이월)
         to_fetch = _cap_fetch_list(
             new_list, stale_list, "Shares",
-            f"신규 {len(new_list):,} + {max_age_days}일 초과 {len(stale_list):,}",
+            f"신규 {len(new_list):,} + {max_age_days}일(±지터) 초과 {len(stale_list):,}",
             len(unique_tickers),
         )
         if not to_fetch:

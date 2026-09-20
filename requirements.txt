@@ -4,5 +4,7 @@ pandas>=2.0
 pyarrow>=14.0
 scipy>=1.11
 numpy>=1.26
+yfinance>=1.4
 requests>=2.31
 python-dotenv>=1.0
+nbformat>=4.2.0
