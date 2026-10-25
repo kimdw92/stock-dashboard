@@ -108,7 +108,7 @@
   border: 1px solid #e2e8f0;
   border-radius: 10px;
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
-  padding: 12px 14px;
+  padding: 10px 12px;
   margin-bottom: 16px;
   overflow: hidden;
 }
@@ -117,25 +117,27 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 10px;
-  padding-bottom: 8px;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
   border-bottom: 1px solid #f1f5f9;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
 .trk-title-wrap {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   min-width: 0;
 }
 
 .trk-icon {
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
 }
 
 .trk-title {
-  font-size: 13.5px;
+  font-size: 12.5px;
   font-weight: 700;
   color: #334155;
   letter-spacing: -0.2px;
@@ -147,19 +149,19 @@
 .trk-pills {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 2px;
   background: #f1f5f9;
-  padding: 2px 4px;
-  border-radius: 12px;
+  padding: 2px 3px;
+  border-radius: 10px;
   flex-shrink: 0;
 }
 
 .trk-pill {
-  font-size: 10.5px;
+  font-size: 9.5px;
   font-weight: 600;
   color: #94a3b8;
-  padding: 1px 7px;
-  border-radius: 10px;
+  padding: 1px 4.5px;
+  border-radius: 8px;
   transition: all 0.15s ease;
   user-select: none;
 }
@@ -174,15 +176,15 @@
 .trk-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3.5px;
 }
 
 .trk-row {
   display: grid;
-  grid-template-columns: minmax(100px, 135px) 1fr 60px;
+  grid-template-columns: minmax(75px, 130px) 1fr 52px;
   align-items: center;
-  gap: 8px;
-  padding: 2.5px 4px;
+  gap: 6px;
+  padding: 2px 3px;
   border-radius: 4px;
   transition: background-color 0.12s ease;
 }
@@ -194,12 +196,12 @@
 .trk-label-cell {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
 }
 
 .trk-name {
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 500;
   color: #1e293b;
   white-space: nowrap;
@@ -209,11 +211,11 @@
 
 .trk-tkr {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 600;
   color: #64748b;
   background: #f1f5f9;
-  padding: 0 4px;
+  padding: 0 3px;
   border-radius: 3px;
   flex-shrink: 0;
 }
@@ -256,7 +258,7 @@
 }
 
 .trk-val {
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 600;
   text-align: right;
   font-variant-numeric: tabular-nums;

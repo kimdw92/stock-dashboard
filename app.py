@@ -558,7 +558,7 @@ def build_tracker_card_html(
         )
 
     if pills is None:
-        pills = ["1D", "1W", "1M", "YTD"]
+        pills = ["1D", "1W", "1M", "3M", "YTD"]
 
     pills_html = "".join(
         f'<span class="trk-pill{" trk-pill-active" if p == active_pill else ""}">{html.escape(p)}</span>'
@@ -1963,6 +1963,7 @@ def _show_sector_tab(
         "1D": ("price_chg_pct", "1일"),
         "1W": ("price_chg_5d_pct", "1주"),
         "1M": ("price_chg_1m_pct", "1개월"),
+        "3M": ("price_chg_3m_pct", "3개월"),
         "YTD": ("YTD", "연초대비"),
     }
     pills_list = list(TRACKER_PERIODS.keys())
@@ -1971,8 +1972,8 @@ def _show_sector_tab(
     with ctrl_left:
         period_mode = st.pills(
             "기간 선택",
-            options=["전체 비교 (1D/1W/1M/YTD)", "1W", "1D", "1M", "YTD"],
-            default="전체 비교 (1D/1W/1M/YTD)",
+            options=["전체 비교 (1D/1W/1M/3M/YTD)", "1W", "1D", "1M", "3M", "YTD"],
+            default="전체 비교 (1D/1W/1M/3M/YTD)",
             key="sector_tracker_period_mode",
         )
     with ctrl_right:
@@ -1984,9 +1985,9 @@ def _show_sector_tab(
         )
 
     if view_mode == "📊 바 트래커":
-        if period_mode == "전체 비교 (1D/1W/1M/YTD)":
+        if period_mode == "전체 비교 (1D/1W/1M/3M/YTD)":
             st.markdown("#### 🔥 섹터 성과 트래커 (Sector Tracker)")
-            st.caption("11대 SPDR 섹터 ETF의 다중 기간(1D, 1W, 1M, YTD) 상대 등락률 비교 — 제로(0%) 기준 상승(파랑) / 하락(분홍)")
+            st.caption("11대 SPDR 섹터 ETF의 다중 기간(1D, 1W, 1M, 3M, YTD) 상대 등락률 비교 — 제로(0%) 기준 상승(파랑) / 하락(분홍)")
             cols = st.columns(len(pills_list))
             for col, p in zip(cols, pills_list):
                 pcol, _ = TRACKER_PERIODS[p]
@@ -2442,6 +2443,7 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
             "1D": ("price_chg_pct", "1일"),
             "1W": ("price_chg_5d_pct", "1주"),
             "1M": ("price_chg_1m_pct", "1개월"),
+            "3M": ("price_chg_3m_pct", "3개월"),
             "YTD": ("YTD", "연초대비"),
         }
         pills_list = list(TRACKER_PERIODS.keys())
@@ -2450,8 +2452,8 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
         with t_ctrl_left:
             t_period_mode = st.pills(
                 "기간 선택",
-                options=["전체 비교 (1D/1W/1M/YTD)", "1W", "1D", "1M", "YTD"],
-                default="전체 비교 (1D/1W/1M/YTD)",
+                options=["전체 비교 (1D/1W/1M/3M/YTD)", "1W", "1D", "1M", "3M", "YTD"],
+                default="전체 비교 (1D/1W/1M/3M/YTD)",
                 key="theme_tracker_period_mode",
             )
         with t_ctrl_right:
@@ -2463,8 +2465,8 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
             )
 
         if t_view_mode == "📊 바 트래커":
-            if t_period_mode == "전체 비교 (1D/1W/1M/YTD)":
-                st.caption("주요 테마 ETF의 다중 기간(1D, 1W, 1M, YTD) 상대 등락률 비교 — 제로(0%) 기준 상승(파랑) / 하락(분홍)")
+            if t_period_mode == "전체 비교 (1D/1W/1M/3M/YTD)":
+                st.caption("주요 테마 ETF의 다중 기간(1D, 1W, 1M, 3M, YTD) 상대 등락률 비교 — 제로(0%) 기준 상승(파랑) / 하락(분홍)")
                 cols = st.columns(len(pills_list))
                 for col, p in zip(cols, pills_list):
                     pcol, _ = TRACKER_PERIODS[p]
