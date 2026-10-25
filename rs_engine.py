@@ -323,6 +323,72 @@ def calc_rs_line_ma_stack(
     return result
 
 
+def calc_rs_line_nh(
+    prices: pd.DataFrame,
+    benchmark: str = "SPY",
+    lookback: int = 50,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    RS Line의 50거래일(약 3개월) 신고가(New High) 여부를 일별 및 최신 스냅샷 기준으로 계산.
+
+    IBD 방법론:
+      주가 신고가 이전에 RS Line이 먼저 신고가를 기록하는 종목은 시장 주도주(Leader)의
+      가장 핵심적인 선행 신호 중 하나임.
+
+    계산 방식:
+      1. wide matrix: rs_line = prices / prices[benchmark]
+      2. 50일 롤링 최고치: rolling_max = rs_line.rolling(lookback, min_periods=min(10, lookback)).max()
+      3. 당일 신고가 판정: is_nh = (rs_line >= rolling_max * 0.9999) & rs_line.notna()
+      4. 3개월(50거래일) 내 신고가 달성 여부: is_nh.rolling(lookback, min_periods=1).max().astype(bool)
+      5. 최신 기준 경과일수(days_ago): 최근 50거래일 내 가장 최근 신고가 달성일로부터 경과 일수
+         - 0: 당일 신고가
+         - 1: 어제(1거래일 전) 신고가
+         - ...
+         - NaN: 최근 50거래일 내 신고가 기록 없음
+
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame]:
+          - hist_df: Long format (date, ticker, rs_line_nh, rs_line_nh_in_3m) - rs_full 병합용
+          - latest_snap_df: DataFrame(ticker, rs_line_nh_today, rs_line_nh_1m, rs_line_nh_3m, rs_line_nh_days_ago) - stock_screener 병합용
+    """
+    logger.info(f"RS Line New High(50거래일 신고가) 일별 집계 중 (벤치마크: {benchmark}, lookback={lookback})")
+    if benchmark not in prices.columns:
+        raise ValueError(f"벤치마크 종목 '{benchmark}'이(가) 데이터에 존재하지 않습니다.")
+
+    rs_line = prices.div(prices[benchmark], axis=0)
+    rolling_max = rs_line.rolling(lookback, min_periods=min(10, lookback)).max()
+    is_nh = (rs_line >= rolling_max * 0.9999) & rs_line.notna()
+    nh_in_3m = is_nh.rolling(lookback, min_periods=1).max().astype(bool)
+
+    # Long format 변환
+    def _to_long(wide: pd.DataFrame, value_name: str) -> pd.DataFrame:
+        r = wide.reset_index()
+        r.rename(columns={r.columns[0]: 'date'}, inplace=True)
+        return r.melt(id_vars='date', var_name='ticker', value_name=value_name)
+
+    hist_df = _to_long(is_nh, 'rs_line_nh')
+    hist_df = hist_df.merge(_to_long(nh_in_3m, 'rs_line_nh_in_3m'), on=['date', 'ticker'], how='left')
+
+    # 최신 스냅샷 지표 계산 (screener용)
+    window = min(lookback, len(is_nh))
+    sub_nh = is_nh.iloc[-window:].to_numpy()
+    dist = np.arange(window - 1, -1, -1)[:, None]
+    dist_masked = np.where(sub_nh, dist, 9999)
+    min_dist = np.min(dist_masked, axis=0)
+    days_ago = pd.Series(np.where(min_dist < 9999, min_dist, np.nan), index=is_nh.columns)
+
+    latest_is_nh = is_nh.iloc[-1] if len(is_nh) > 0 else pd.Series(False, index=is_nh.columns)
+    latest_snap_df = pd.DataFrame({
+        'ticker': is_nh.columns,
+        'rs_line_nh_today': latest_is_nh.values,
+        'rs_line_nh_1m': (days_ago <= 21).values,
+        'rs_line_nh_3m': days_ago.notna().values,
+        'rs_line_nh_days_ago': days_ago.values,
+    })
+
+    return hist_df, latest_snap_df
+
+
 def calc_rs_slope(rs_series: pd.Series, window: int = 20) -> pd.Series:
     """
     최근 window일간의 RS Line 값에 대해 선형회귀 기울기(slope)를 계산 (벡터화 최적화).
@@ -460,6 +526,7 @@ def build_stock_screener(
     market_cap_s: pd.Series = None,
     sector_info_df: pd.DataFrame = None,
     avg_dv_days: int = 20,
+    rs_line_nh_snap_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     전체 유니버스 개별 종목의 최신 RS 지표 스냅샷.
@@ -468,12 +535,14 @@ def build_stock_screener(
     ETF 보유 종목 매핑(etf_holdings)과 테마(etf_to_theme)는 선택적 enrichment.
     prices_df / volume_df가 주어지면 latest_price, avg_dollar_volume 컬럼 추가.
     market_cap_s(ticker→시가총액 $)가 주어지면 market_cap 컬럼 추가.
+    rs_line_nh_snap_df가 주어지면 rs_line_nh_today, rs_line_nh_1m, rs_line_nh_3m, rs_line_nh_days_ago 추가.
     사전 필터링 없이 전체를 저장 — 필터링은 대시보드(app.py)에서 수행.
 
     Returns:
         pd.DataFrame: ticker, rs_rank, rs_percentile, rs_score, rs_slope,
                       latest_price, avg_dollar_volume, market_cap, parent_etf, theme,
-                      rs_line_ma_stack, rs_line_stack_days (RS Line 20/50 SMA 정배열)
+                      rs_line_ma_stack, rs_line_stack_days,
+                      rs_line_nh_today, rs_line_nh_1m, rs_line_nh_3m, rs_line_nh_days_ago
                       (rs_percentile 내림차순)
     """
     logger.info("종목 스크리너 생성 (전체 유니버스 기준)")
@@ -545,10 +614,16 @@ def build_stock_screener(
     else:
         stocks_df['theme'] = ""
 
+    # ── RS Line New High 최신 스냅샷 enrichment ─────────────────────────────
+    if rs_line_nh_snap_df is not None and not rs_line_nh_snap_df.empty:
+        stocks_df = stocks_df.merge(rs_line_nh_snap_df, on='ticker', how='left')
+
     cols = ['ticker', 'rs_rank', 'rs_percentile', 'rs_score', 'rs_slope',
             'latest_price', 'avg_dollar_volume', 'market_cap', 'industry', 'parent_etf', 'theme',
             'rs_line_ema21', 'rs_line_phase', 'rs_line_3m_pct', 'rs_line_1m_pct',
             'rs_line_ma_stack', 'rs_line_stack_days', 'rs_line_sma20', 'rs_line_sma50',
+            'rs_line_nh', 'rs_line_nh_in_3m',
+            'rs_line_nh_today', 'rs_line_nh_1m', 'rs_line_nh_3m', 'rs_line_nh_days_ago',
             'rs_1m', 'rs_3m', 'rs_1m_pct', 'rs_3m_pct',
             'price_chg_pct', 'price_chg_5d_pct',
             'price_chg_1m_pct', 'price_chg_3m_pct', 'price_chg_6m_pct', 'price_chg_1y_pct']
@@ -901,6 +976,11 @@ def run_pipeline(config: Dict[str, Any]) -> None:
     ma_stack_df = calc_rs_line_ma_stack(prices, benchmark=benchmark)
     rs_df = pd.merge(rs_df, ma_stack_df, on=["date", "ticker"], how="left")
 
+    # RS Line New High(50거래일 신고가) 계산 및 병합
+    logger.info("RS Line New High(50거래일 신고가) 계산 및 병합 중")
+    nh_hist_df, nh_snap_df = calc_rs_line_nh(prices, benchmark=benchmark, lookback=50)
+    rs_df = pd.merge(rs_df, nh_hist_df, on=["date", "ticker"], how="left")
+
     # 4. RS 기울기 계산
     logger.info("RS Line Slope(기울기) 계산 중 (기간: 20일, 기준: RS Line)")
     rs_df = rs_df.sort_values(['ticker', 'date'])
@@ -978,6 +1058,7 @@ def run_pipeline(config: Dict[str, Any]) -> None:
         volume_df=vol_df,
         market_cap_s=market_cap_s,
         sector_info_df=sector_info_df,
+        rs_line_nh_snap_df=nh_snap_df,
     )
 
     # 6-B. Breadth 지표 계산 (NYSE / NASDAQ / AMEX 종목 기반)
@@ -1057,6 +1138,7 @@ def run_pipeline(config: Dict[str, Any]) -> None:
     # rs_slope, rs_rank, rs_percentile,
     # rs_line_ema21, rs_line_phase,
     # rs_line_sma20, rs_line_sma50, rs_line_ma_stack, rs_line_stack_days,
+    # rs_line_nh, rs_line_nh_in_3m,
     # rs_1m, rs_3m, rs_1m_pct, rs_3m_pct, price_chg_pct, price_chg_5d_pct
     rs_df.to_parquet(output_dir / "rs_full.parquet", index=False)
     

@@ -15,6 +15,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ─── 상수 ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
@@ -33,6 +34,7 @@ _SCREENER_CFG_KEYS: list[str] = [
     "screener_slope_chk",
     "screener_phase_filter",
     "screener_ma_stack_filter",
+    "screener_rs_nh_filter",
     "screener_stack_days_min",
     "screener_etf_only",
     "screener_price_min",
@@ -528,7 +530,133 @@ def _perf_cell(value: float, style: str) -> str:
     return f'<td class="{cls}"{style_attr}>{_fmt_pct(value)}</td>'
 
 
+
+def build_tracker_card_html(
+    title: str,
+    df: pd.DataFrame,
+    period_col: str,
+    active_pill: str = "1W",
+    pills: list[str] | None = None,
+    name_col: str = "sector_name",
+    ticker_col: str = "ticker",
+    icon: str = "🔥",
+    subtitle: str = "",
+    top_n: int | None = None,
+) -> str:
+    """제로축(50%) 기준 양방향 다이버지드 바 차트 카드의 HTML을 생성한다.
+
+    - 0% 중심선을 기준으로 상승(+%)은 우측 블루 바, 하락(-%)은 좌측 핑크/마젠타 바로 표시
+    - 길이는 해당 기간 최대 절댓값(max_abs) 대비 비율로 계산
+    - 상단 헤더에 타이틀 및 기간 뱃지(1D, 1W, 1M, YTD) 포함
+    """
+    if df is None or df.empty or period_col not in df.columns:
+        return (
+            f'<div class="trk-card"><div class="trk-header">'
+            f'<div class="trk-title-wrap"><span class="trk-icon">{icon}</span>'
+            f'<span class="trk-title">{html.escape(title)}</span></div></div>'
+            f'<div class="trk-list"><p style="color:#94a3b8;font-size:12px;padding:8px 4px;">표시할 데이터가 없습니다.</p></div></div>'
+        )
+
+    if pills is None:
+        pills = ["1D", "1W", "1M", "YTD"]
+
+    pills_html = "".join(
+        f'<span class="trk-pill{" trk-pill-active" if p == active_pill else ""}">{html.escape(p)}</span>'
+        for p in pills
+    )
+
+    data = df.dropna(subset=[name_col]).copy()
+    data[period_col] = pd.to_numeric(data[period_col], errors="coerce")
+    data = data.sort_values(period_col, ascending=False, na_position="last").reset_index(drop=True)
+    if top_n is not None:
+        data = data.head(top_n)
+
+    valid_vals = data[period_col].dropna()
+    max_abs = float(np.nanmax(np.abs(valid_vals))) if not valid_vals.empty else 1.0
+    if max_abs <= 0:
+        max_abs = 1.0
+
+    rows_html: list[str] = []
+    has_ticker = ticker_col in data.columns
+
+    for _, row in data.iterrows():
+        name = html.escape(str(row[name_col]))
+        tkr = html.escape(str(row[ticker_col])) if has_ticker and pd.notna(row.get(ticker_col)) else ""
+        tkr_html = f'<span class="trk-tkr">{tkr}</span>' if tkr else ""
+        val = row[period_col]
+
+        if pd.isna(val):
+            bar_html = ""
+            val_html = '<div class="trk-val trk-val-zero">–</div>'
+        elif val >= 0:
+            w = min(49.5, max(0.8, (val / max_abs) * 50.0))
+            bar_html = f'<div class="trk-bar trk-bar-pos" style="left: 50%; width: {w:.1f}%;"></div>'
+            val_html = f'<div class="trk-val trk-val-pos">+{val:.2f}%</div>'
+        else:
+            w = min(49.5, max(0.8, (abs(val) / max_abs) * 50.0))
+            left = 50.0 - w
+            bar_html = f'<div class="trk-bar trk-bar-neg" style="left: {left:.1f}%; width: {w:.1f}%;"></div>'
+            val_html = f'<div class="trk-val trk-val-neg">{val:.2f}%</div>'
+
+        rows_html.append(
+            f'<div class="trk-row">'
+            f'  <div class="trk-label-cell">'
+            f'    <span class="trk-name" title="{name}">{name}</span>'
+            f'    {tkr_html}'
+            f'  </div>'
+            f'  <div class="trk-track">{bar_html}</div>'
+            f'  {val_html}'
+            f'</div>'
+        )
+
+    subtitle_html = f'<span class="trk-subtitle">{html.escape(subtitle)}</span>' if subtitle else ""
+    return (
+        f'<div class="trk-card">'
+        f'  <div class="trk-header">'
+        f'    <div class="trk-title-wrap">'
+        f'      <span class="trk-icon">{icon}</span>'
+        f'      <span class="trk-title">{html.escape(title)}</span>'
+        f'      {subtitle_html}'
+        f'    </div>'
+        f'    <div class="trk-pills">{pills_html}</div>'
+        f'  </div>'
+        f'  <div class="trk-list">'
+        f'    {"".join(rows_html)}'
+        f'  </div>'
+        f'</div>'
+    )
+
+
+def render_performance_tracker(
+    title: str,
+    df: pd.DataFrame,
+    period_col: str,
+    active_pill: str = "1W",
+    pills: list[str] | None = None,
+    name_col: str = "sector_name",
+    ticker_col: str = "ticker",
+    icon: str = "🔥",
+    subtitle: str = "",
+    top_n: int | None = None,
+) -> None:
+    """Streamlit에 양방향 바 차트 카드를 렌더링한다."""
+    html_content = build_tracker_card_html(
+        title=title,
+        df=df,
+        period_col=period_col,
+        active_pill=active_pill,
+        pills=pills,
+        name_col=name_col,
+        ticker_col=ticker_col,
+        icon=icon,
+        subtitle=subtitle,
+        top_n=top_n,
+    )
+    st.markdown(html_content, unsafe_allow_html=True)
+
+
 PERF_52W_WINDOW = 252  # 52주 = 약 252 거래일
+
 
 
 @st.cache_data
@@ -1798,7 +1926,11 @@ def render_sidebar(rs_full: pd.DataFrame) -> None:
 
 
 # ─── Tab 1: 섹터 분석 ─────────────────────────────────────────────────────────
-def _show_sector_tab(sector_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
+def _show_sector_tab(
+    sector_summary: pd.DataFrame,
+    rs_full: pd.DataFrame,
+    theme_summary: pd.DataFrame | None = None,
+) -> None:
     st.subheader("Sector RS Overview")
 
     df = sector_summary[sector_summary["ticker"].isin(SECTOR_TICKERS)].copy()
@@ -1808,33 +1940,135 @@ def _show_sector_tab(sector_summary: pd.DataFrame, rs_full: pd.DataFrame) -> Non
     df = df.sort_values("rs_score", ascending=False).reset_index(drop=True)
     df["rs_rank"] = range(1, len(df) + 1)
 
-    # 섹션 A: 시장 RS 순위표 (주요 지수 ETF 비교)
-    with st.container():
-        st.markdown("#### 시장 RS 순위표")
-        st.caption("주요 지수 ETF 비교 — 대형/중형/소형, 시총가중 vs 동일가중")
-        latest_date = rs_full["date"].max()
-        mkt = rs_full[
-            (rs_full["date"] == latest_date)
-            & (rs_full["ticker"].isin(MARKET_INDEX_TICKERS))
-        ].drop_duplicates("ticker").copy()
-        if mkt.empty:
-            st.info("시장 지수 ETF 데이터가 없습니다.")
+    latest_date = rs_full["date"].max()
+    mkt = rs_full[
+        (rs_full["date"] == latest_date)
+        & (rs_full["ticker"].isin(MARKET_INDEX_TICKERS))
+    ].drop_duplicates("ticker").copy()
+    if not mkt.empty:
+        mkt["sector_name"] = mkt["ticker"].map(MARKET_INDEX_NAME_MAP).fillna(mkt["ticker"])
+        mkt = mkt.sort_values("rs_score", ascending=False).reset_index(drop=True)
+        mkt["rs_rank"] = range(1, len(mkt) + 1)
+
+    # YTD 성과 병합 (theme_summary에서 계산)
+    if theme_summary is not None and not theme_summary.empty:
+        perf = _build_etf_performance(theme_summary)
+        if not perf.empty and "YTD" in perf.columns:
+            ytd_map = perf["YTD"].to_dict()
+            df["YTD"] = df["ticker"].map(ytd_map)
+            if not mkt.empty:
+                mkt["YTD"] = mkt["ticker"].map(ytd_map)
+
+    TRACKER_PERIODS = {
+        "1D": ("price_chg_pct", "1일"),
+        "1W": ("price_chg_5d_pct", "1주"),
+        "1M": ("price_chg_1m_pct", "1개월"),
+        "YTD": ("YTD", "연초대비"),
+    }
+    pills_list = list(TRACKER_PERIODS.keys())
+
+    ctrl_left, ctrl_right = st.columns([7, 3])
+    with ctrl_left:
+        period_mode = st.pills(
+            "기간 선택",
+            options=["전체 비교 (1D/1W/1M/YTD)", "1W", "1D", "1M", "YTD"],
+            default="전체 비교 (1D/1W/1M/YTD)",
+            key="sector_tracker_period_mode",
+        )
+    with ctrl_right:
+        view_mode = st.segmented_control(
+            "보기 모드",
+            options=["📊 바 트래커", "📋 상세 테이블"],
+            default="📊 바 트래커",
+            key="sector_view_mode",
+        )
+
+    if view_mode == "📊 바 트래커":
+        if period_mode == "전체 비교 (1D/1W/1M/YTD)":
+            st.markdown("#### 🔥 섹터 성과 트래커 (Sector Tracker)")
+            st.caption("11대 SPDR 섹터 ETF의 다중 기간(1D, 1W, 1M, YTD) 상대 등락률 비교 — 제로(0%) 기준 상승(파랑) / 하락(분홍)")
+            cols = st.columns(len(pills_list))
+            for col, p in zip(cols, pills_list):
+                pcol, _ = TRACKER_PERIODS[p]
+                with col:
+                    render_performance_tracker(
+                        title="Sector Tracker",
+                        df=df,
+                        period_col=pcol,
+                        active_pill=p,
+                        pills=pills_list,
+                        name_col="sector_name",
+                        ticker_col="ticker",
+                        icon="🔥",
+                    )
+
+            if not mkt.empty:
+                with st.expander("🌐 주요 시장 지수 ETF 전체 비교 (대형/중형/소형, 시총가중 vs 동일가중)", expanded=False):
+                    mcols = st.columns(len(pills_list))
+                    for mcol, p in zip(mcols, pills_list):
+                        pcol, _ = TRACKER_PERIODS[p]
+                        with mcol:
+                            render_performance_tracker(
+                                title="Market Tracker",
+                                df=mkt,
+                                period_col=pcol,
+                                active_pill=p,
+                                pills=pills_list,
+                                name_col="sector_name",
+                                ticker_col="ticker",
+                                icon="🌐",
+                            )
         else:
-            mkt["sector_name"] = mkt["ticker"].map(MARKET_INDEX_NAME_MAP).fillna(mkt["ticker"])
-            mkt = mkt.sort_values("rs_score", ascending=False).reset_index(drop=True)
-            mkt["rs_rank"] = range(1, len(mkt) + 1)
+            pcol, plabel = TRACKER_PERIODS.get(period_mode, ("price_chg_5d_pct", "1주"))
+            c_sec, c_mkt = st.columns([6, 4])
+            with c_sec:
+                render_performance_tracker(
+                    title=f"Sector Tracker ({period_mode})",
+                    df=df,
+                    period_col=pcol,
+                    active_pill=period_mode,
+                    pills=pills_list,
+                    name_col="sector_name",
+                    ticker_col="ticker",
+                    icon="🔥",
+                    subtitle=f"{plabel} 등락률 순",
+                )
+            with c_mkt:
+                if not mkt.empty:
+                    render_performance_tracker(
+                        title=f"Market Tracker ({period_mode})",
+                        df=mkt,
+                        period_col=pcol,
+                        active_pill=period_mode,
+                        pills=pills_list,
+                        name_col="sector_name",
+                        ticker_col="ticker",
+                        icon="🌐",
+                        subtitle=f"{plabel} 등락률 순",
+                    )
+    else:
+        # 섹션 A: 시장 RS 순위표 (기존 상세 테이블)
+        with st.container():
+            st.markdown("#### 시장 RS 순위표")
+            st.caption("주요 지수 ETF 비교 — 대형/중형/소형, 시총가중 vs 동일가중")
+            if mkt.empty:
+                st.info("시장 지수 ETF 데이터가 없습니다.")
+            else:
+                _render_ranking_table(
+                    mkt, height=250,
+                    exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
+                )
+
+        # 섹션 B: 섹터 RS 순위표 (기존 상세 테이블)
+        with st.container():
+            st.markdown("#### 섹터 RS 순위표")
             _render_ranking_table(
-                mkt, height=250,
+                df, height=550,
                 exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
             )
 
-    # 섹션 B: 섹터 RS 순위표
-    with st.container():
-        st.markdown("#### 섹터 RS 순위표")
-        _render_ranking_table(
-            df, height=550,
-            exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
-        )
+    st.divider()
+
 
     # 섹션 C: RS Line 추이
     with st.container():
@@ -2194,13 +2428,75 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
         else theme_summary.copy()
     )
 
-    # 섹션 C: 테마 ETF RS 순위표
+    # 섹션 C: 테마 ETF 성과 & RS 순위
     with st.container():
-        st.markdown("#### 테마 ETF RS 순위표")
-        _render_ranking_table(
-            df, height=550,
-            exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
-        )
+        st.markdown("#### 테마 ETF 성과 & RS")
+
+        # YTD 성과 병합
+        perf = _build_etf_performance(theme_summary)
+        if not perf.empty and "YTD" in perf.columns:
+            ytd_map = perf["YTD"].to_dict()
+            df["YTD"] = df["ticker"].map(ytd_map)
+
+        TRACKER_PERIODS = {
+            "1D": ("price_chg_pct", "1일"),
+            "1W": ("price_chg_5d_pct", "1주"),
+            "1M": ("price_chg_1m_pct", "1개월"),
+            "YTD": ("YTD", "연초대비"),
+        }
+        pills_list = list(TRACKER_PERIODS.keys())
+
+        t_ctrl_left, t_ctrl_right = st.columns([7, 3])
+        with t_ctrl_left:
+            t_period_mode = st.pills(
+                "기간 선택",
+                options=["전체 비교 (1D/1W/1M/YTD)", "1W", "1D", "1M", "YTD"],
+                default="전체 비교 (1D/1W/1M/YTD)",
+                key="theme_tracker_period_mode",
+            )
+        with t_ctrl_right:
+            t_view_mode = st.segmented_control(
+                "보기 모드",
+                options=["📊 바 트래커", "📋 상세 테이블"],
+                default="📊 바 트래커",
+                key="theme_view_mode",
+            )
+
+        if t_view_mode == "📊 바 트래커":
+            if t_period_mode == "전체 비교 (1D/1W/1M/YTD)":
+                st.caption("주요 테마 ETF의 다중 기간(1D, 1W, 1M, YTD) 상대 등락률 비교 — 제로(0%) 기준 상승(파랑) / 하락(분홍)")
+                cols = st.columns(len(pills_list))
+                for col, p in zip(cols, pills_list):
+                    pcol, _ = TRACKER_PERIODS[p]
+                    with col:
+                        render_performance_tracker(
+                            title="Theme Tracker",
+                            df=df,
+                            period_col=pcol,
+                            active_pill=p,
+                            pills=pills_list,
+                            name_col="theme",
+                            ticker_col="ticker",
+                            icon="🔥",
+                        )
+            else:
+                pcol, plabel = TRACKER_PERIODS.get(t_period_mode, ("price_chg_5d_pct", "1주"))
+                render_performance_tracker(
+                    title=f"Theme Tracker ({t_period_mode})",
+                    df=df,
+                    period_col=pcol,
+                    active_pill=t_period_mode,
+                    pills=pills_list,
+                    name_col="theme",
+                    ticker_col="ticker",
+                    icon="🔥",
+                    subtitle=f"{plabel} 등락률 순",
+                )
+        else:
+            _render_ranking_table(
+                df, height=550,
+                exclude_cols=["rs_score", "rs_slope", "rs_1m_pct", "rs_3m_pct", "rs_line_phase"],
+            )
 
     # 섹션 D: RS Line 추이
     with st.container():
@@ -2241,7 +2537,11 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
 
 
 # ─── Tab 3: 종목 스크리너 ─────────────────────────────────────────────────────
-def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | None = None) -> None:
+def _show_screener_tab(
+    screener: pd.DataFrame,
+    tech_indicators: pd.DataFrame | None = None,
+    rs_full: pd.DataFrame | None = None,
+) -> None:
     st.subheader("종목 스크리너")
 
     # 세션 첫 진입 시 저장된 설정 로드 → session_state 초기화
@@ -2266,13 +2566,31 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
             )
             screener = screener.merge(atr_today, on="ticker", how="left")
 
+    # rs_line_nh_3m / rs_line_nh_days_ago 보강 — screener에 없으면 rs_full에서 fallback
+    if "rs_line_nh_3m" not in screener.columns and rs_full is not None and not rs_full.empty and "rs_line" in rs_full.columns:
+        try:
+            rs_p = rs_full.pivot(index="date", columns="ticker", values="rs_line")
+            r_max = rs_p.rolling(50, min_periods=10).max()
+            is_nh_w = (rs_p >= r_max * 0.9999) & rs_p.notna()
+            window_len = min(50, len(is_nh_w))
+            sub_w = is_nh_w.iloc[-window_len:].to_numpy()
+            dist_w = np.arange(window_len - 1, -1, -1)[:, None]
+            min_dist_w = np.min(np.where(sub_w, dist_w, 9999), axis=0)
+            days_ago_s = pd.Series(np.where(min_dist_w < 9999, min_dist_w, np.nan), index=is_nh_w.columns)
+            screener["rs_line_nh_today"] = screener["ticker"].map(is_nh_w.iloc[-1]).fillna(False)
+            screener["rs_line_nh_1m"] = screener["ticker"].map(days_ago_s <= 21).fillna(False)
+            screener["rs_line_nh_3m"] = screener["ticker"].map(days_ago_s.notna()).fillna(False)
+            screener["rs_line_nh_days_ago"] = screener["ticker"].map(days_ago_s)
+        except Exception:
+            pass
+
     has_price   = "latest_price"      in screener.columns
     has_adv     = "avg_dollar_volume" in screener.columns
     has_mktcap  = "market_cap"        in screener.columns
     has_atr_pct = "atr_pct"           in screener.columns
 
     # ── 필터 컨트롤 행 1 ─────────────────────────────────────────────────────
-    f1, f2, f3, f4, f5 = st.columns([3, 2, 2, 2, 3])
+    f1, f2, f3, f4, f5 = st.columns([3, 2, 2.5, 2.5, 3])
 
     with f1:
         pct_min = st.slider(
@@ -2302,6 +2620,9 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         slope_only = st.checkbox(
             "RS Slope 양수만", value=True, key="screener_slope_chk"
         )
+        etf_only = st.checkbox(
+            "ETF 편입 종목만", value=False, key="screener_etf_only"
+        )
     with f3:
         selected_phase = st.multiselect(
             "RS Line Phase 필터",
@@ -2319,8 +2640,15 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
                  "추세적 강세주. 비워두면 전체 표시.",
         )
     with f4:
-        etf_only = st.checkbox(
-            "ETF 편입 종목만", value=False, key="screener_etf_only"
+        nh_filter_options = ["전체", "3개월 내 신고가", "1개월 내 신고가", "오늘 신고가"]
+        saved_nh = st.session_state.get("screener_rs_nh_filter", "전체")
+        nh_index = nh_filter_options.index(saved_nh) if saved_nh in nh_filter_options else 0
+        rs_nh_filter = st.selectbox(
+            "RS Line 신고가 (NH)",
+            options=nh_filter_options,
+            index=nh_index,
+            key="screener_rs_nh_filter",
+            help="RS Line 50거래일(3개월) 신고가 필터.\n- 3개월 내: 최근 50거래일 내 1회 이상 RS 신고가 달성\n- 1개월 내: 최근 21거래일 내 RS 신고가 달성\n- 오늘: 당일 RS 신고가 달성",
         )
     with f5:
         ticker_search = st.text_input(
@@ -2386,9 +2714,9 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
             "1개월 RS 백분위 (단기)":    "rs_1m_pct",
             "3개월 RS 백분위 (중기)":    "rs_3m_pct",
             "RS Percentile":       "rs_percentile",
-
             "RS Slope":            "rs_slope",
             "정배열 유지일":        "rs_line_stack_days",
+            "최근 RS 신고가순":     "rs_line_nh_days_ago",
         }
         sort_label = st.selectbox(
             "정렬 기준",
@@ -2440,6 +2768,25 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         filtered = filtered[filtered["rs_line_stack_days"].fillna(0) >= stack_days_min]
     if etf_only and "parent_etf" in filtered.columns:
         filtered = filtered[filtered["parent_etf"] != ""]
+    if rs_nh_filter == "오늘 신고가":
+        if "rs_line_nh_today" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh_today"] == True]
+        elif "rs_line_nh_days_ago" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh_days_ago"] == 0]
+        elif "rs_line_nh" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh"] == True]
+    elif rs_nh_filter == "1개월 내 신고가":
+        if "rs_line_nh_1m" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh_1m"] == True]
+        elif "rs_line_nh_days_ago" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh_days_ago"] <= 21]
+    elif rs_nh_filter == "3개월 내 신고가":
+        if "rs_line_nh_3m" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh_3m"] == True]
+        elif "rs_line_nh_days_ago" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh_days_ago"].notna()]
+        elif "rs_line_nh_in_3m" in filtered.columns:
+            filtered = filtered[filtered["rs_line_nh_in_3m"] == True]
     if ticker_search.strip():
         filtered = filtered[
             filtered["ticker"].str.contains(ticker_search.strip().upper(), na=False)
@@ -2461,7 +2808,8 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
 
     # ── 정렬 ──────────────────────────────────────────────────────────────────
     sort_target = sort_col if sort_col in filtered.columns else "rs_percentile"
-    filtered = filtered.sort_values(sort_target, ascending=False).reset_index(drop=True)
+    is_ascending = (sort_target == "rs_line_nh_days_ago")
+    filtered = filtered.sort_values(sort_target, ascending=is_ascending, na_position="last").reset_index(drop=True)
 
     # 표시용 단위 변환 컬럼 추가
     if has_adv:
@@ -2469,9 +2817,15 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
     if has_mktcap:
         filtered["mktcap_b"] = filtered["market_cap"] / 1e9
     st.caption(f"총 {len(filtered):,}개 종목 (전체 {len(screener):,}개 중)")
+    caption_parts = []
     if selected_phase:
+        caption_parts.append(f"Phase 필터: {', '.join(selected_phase)}")
+    if rs_nh_filter != "전체":
+        caption_parts.append(f"RS Line 신고가: {rs_nh_filter}")
+    if caption_parts:
+        sort_dir_str = "오름차순" if is_ascending else "내림차순"
         st.caption(
-            f"Phase 필터: {', '.join(selected_phase)} → {sort_label} 기준 내림차순 정렬"
+            f"{' | '.join(caption_parts)} → {sort_label} 기준 {sort_dir_str} 정렬"
         )
 
     display_cols = [c for c in [
@@ -2479,7 +2833,9 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         "price_chg_pct", "price_chg_5d_pct",
         "price_chg_1m_pct", "price_chg_3m_pct", "price_chg_6m_pct", "price_chg_1y_pct",
         "rs_percentile", "rs_1m_pct", "rs_3m_pct",
-        "rs_line_phase", "rs_line_ma_stack", "rs_line_stack_days", "atr_multiple",
+        "rs_line_phase", "rs_line_ma_stack", "rs_line_stack_days",
+        "rs_line_nh_3m", "rs_line_nh_days_ago",
+        "atr_multiple",
         "latest_price", "adv_m", "mktcap_b", "atr_pct",
         "parent_etf", "theme",
     ] if c in filtered.columns]
@@ -2511,6 +2867,15 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
         "rs_line_phase": st.column_config.TextColumn("RS Phase"),
         "rs_line_ma_stack":   st.column_config.TextColumn("MA 정배열"),
         "rs_line_stack_days": st.column_config.NumberColumn("정배열 유지일", format="%d"),
+        "rs_line_nh_3m": st.column_config.CheckboxColumn(
+            "RS 신고가(3M)",
+            help="최근 3개월(50거래일) 내 RS Line 신고가 달성 여부"
+        ),
+        "rs_line_nh_days_ago": st.column_config.NumberColumn(
+            "최근 RS 신고가",
+            format="%d일 전",
+            help="가장 최근 RS Line 50일 신고가를 기록한 날로부터 경과한 거래일수 (0일 전 = 당일 신고가)"
+        ),
     }
 
     def _phase_row_color(row) -> list[str]:
@@ -2542,19 +2907,68 @@ def _show_screener_tab(screener: pd.DataFrame, tech_indicators: pd.DataFrame | N
     # ── 티커 목록 복사 ────────────────────────────────────────────────────────
     # st.code 우측 상단의 복사 버튼으로 클립보드에 그대로 담긴다.
     if "ticker" in filtered.columns and not filtered.empty:
-        tickers = filtered["ticker"].dropna().astype(str).str.strip()
-        tickers = tickers[tickers != ""].drop_duplicates().tolist()
+        all_tickers = filtered["ticker"].dropna().astype(str).str.strip()
+        all_tickers = all_tickers[all_tickers != ""].drop_duplicates().tolist()
 
-        with st.expander(f"📋 티커 목록 복사 ({len(tickers):,}개)"):
-            sep_label = st.radio(
-                "구분자",
-                options=["쉼표 (NVDA, TSLA)", "공백 (NVDA TSLA)", "줄바꿈"],
-                index=0,
-                horizontal=True,
-                key="screener_copy_sep",
-            )
+        with st.expander(f"📋 티커 목록 복사 (총 {len(all_tickers):,}개)"):
+            has_ind = "industry" in filtered.columns
+            if has_ind:
+                c_sep, c_ind = st.columns([4, 6])
+            else:
+                c_sep = st.container()
+
+            with c_sep:
+                sep_label = st.radio(
+                    "구분자",
+                    options=["쉼표 (NVDA, TSLA)", "공백 (NVDA TSLA)", "줄바꿈"],
+                    index=0,
+                    horizontal=True,
+                    key="screener_copy_sep",
+                )
+
+            selected_industries = []
+            if has_ind:
+                with c_ind:
+                    ind_series = filtered["industry"].fillna("(미분류)").astype(str).str.strip()
+                    ind_series = ind_series.replace("", "(미분류)")
+                    ind_counts = ind_series.value_counts()
+                    ind_options = list(ind_counts.index)
+
+                    # session_state에 저장된 선택값 중 현재 options에 없는 항목 정리 (필터 변경 시 예외 방지)
+                    if "screener_copy_industry" in st.session_state:
+                        valid_vals = [v for v in st.session_state["screener_copy_industry"] if v in ind_options]
+                        if len(valid_vals) != len(st.session_state["screener_copy_industry"]):
+                            st.session_state["screener_copy_industry"] = valid_vals
+
+                    selected_industries = st.multiselect(
+                        "복사할 업종 선택 (미선택 시 전체 복사)",
+                        options=ind_options,
+                        default=[],
+                        format_func=lambda x: f"{x} ({ind_counts.get(x, 0)})",
+                        placeholder="특정 업종만 선택하여 복사...",
+                        key="screener_copy_industry",
+                    )
+
+            # 대상 티커 추출
+            copy_df = filtered
+            if selected_industries and has_ind:
+                ind_series = filtered["industry"].fillna("(미분류)").astype(str).str.strip().replace("", "(미분류)")
+                copy_df = copy_df[ind_series.isin(selected_industries)]
+
+            tickers = copy_df["ticker"].dropna().astype(str).str.strip()
+            tickers = tickers[tickers != ""].drop_duplicates().tolist()
+
             sep = {"쉼표 (NVDA, TSLA)": ", ", "공백 (NVDA TSLA)": " "}.get(sep_label, "\n")
-            st.code(sep.join(tickers), language=None, wrap_lines=True)
+
+            if selected_industries:
+                st.caption(f"선택한 업종 종목: **{len(tickers):,}개** / 전체 {len(all_tickers):,}개")
+            else:
+                st.caption(f"전체 복사 대상: **{len(tickers):,}개**")
+
+            if tickers:
+                st.code(sep.join(tickers), language=None, wrap_lines=True)
+            else:
+                st.info("선택한 업종에 해당하는 종목이 없습니다.")
 
 
 # ─── Tab 4: Market Breadth ────────────────────────────────────────────────────
@@ -2590,9 +3004,12 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
     latest = df.iloc[-1]
     score = int(latest.get("breadth_score", 0))
     score_label, _ = BREADTH_SCORE_LABELS.get(score, ("N/A", "secondary"))
+    nh = int(latest.get("new_high_count", 0))
+    nl = int(latest.get("new_low_count", 0))
+    nnh = int(latest.get("net_new_high", 0))
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Net New High",   f"{int(latest.get('net_new_high', 0)):+d}")
+    c1.metric("Net New High",   f"{nnh:+d}", delta=f"NH {nh:,} / NL {nl:,}", delta_color="off")
     c2.metric("50MA 위 비율",   f"{latest.get('pct_above_50ma', 0):.1f}%")
     c3.metric("200MA 위 비율",  f"{latest.get('pct_above_200ma', 0):.1f}%")
     c4.metric("A/D Line",       f"{int(latest.get('ad_line', 0)):,}")
@@ -2600,35 +3017,131 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
 
     st.divider()
 
-    # 섹션 A: 52W Net New High
+    # 섹션 A: 52W New High / New Low & Net New High
     with st.container():
-        st.markdown("#### 52주 Net New High")
+        col_title, col_view = st.columns([6, 4])
+        with col_title:
+            st.markdown("#### 52주 New High / New Low & Net New High")
+        with col_view:
+            chart_view = st.radio(
+                "차트 표시 방식",
+                options=["2단 분할 (상세)", "단일 통합 (High-Low)"],
+                index=0,
+                horizontal=True,
+                key="breadth_nh_nl_view",
+                label_visibility="collapsed",
+            )
 
         df["nnh_ma20"] = df["net_new_high"].rolling(20).mean()
-        colors = df["net_new_high"].apply(lambda v: "#1D9E75" if v >= 0 else "#E24B4A")
 
-        fig_nnh = go.Figure()
-        fig_nnh.add_trace(go.Bar(
-            x=df["date"],
-            y=df["net_new_high"],
-            marker_color=colors,
-            name="Net New High",
-            hovertemplate="%{x|%Y-%m-%d}<br>Net New High: %{y:+d}",
-        ))
-        fig_nnh.add_trace(go.Scatter(
-            x=df["date"], y=df["nnh_ma20"],
-            line=dict(color="#EF9F27", width=1.5),
-            name="20MA",
-            hovertemplate="%{x|%Y-%m-%d}<br>20MA: %{y:.1f}",
-        ))
-        fig_nnh.add_hline(y=0, line_dash="dot", line_color="gray", line_width=0.8)
-        fig_nnh.update_layout(
-            height=280,
-            margin=dict(t=10, b=40, l=0, r=0),
-            legend=dict(orientation="h", y=-0.2),
-            hovermode="x unified",
-            bargap=0.1,
-        )
+        if chart_view == "2단 분할 (상세)":
+            fig_nnh = make_subplots(
+                rows=2, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.10,
+                subplot_titles=["52주 New High & New Low (개별 종목 수)", "52주 Net New High & 20MA"],
+                row_heights=[0.48, 0.52],
+            )
+
+            # Row 1: New High & New Low Bar
+            fig_nnh.add_trace(go.Bar(
+                x=df["date"],
+                y=df["new_high_count"],
+                name="52W New High",
+                marker_color="#1D9E75",
+                hovertemplate="%{x|%Y-%m-%d}<br>New High: %{y:,}개",
+            ), row=1, col=1)
+
+            fig_nnh.add_trace(go.Bar(
+                x=df["date"],
+                y=df["new_low_count"],
+                name="52W New Low",
+                marker_color="#E24B4A",
+                hovertemplate="%{x|%Y-%m-%d}<br>New Low: %{y:,}개",
+            ), row=1, col=1)
+
+            # Row 2: Net New High Bar & 20MA Line
+            colors = df["net_new_high"].apply(lambda v: "#1D9E75" if v >= 0 else "#E24B4A")
+            fig_nnh.add_trace(go.Bar(
+                x=df["date"],
+                y=df["net_new_high"],
+                marker_color=colors,
+                name="Net New High",
+                hovertemplate="%{x|%Y-%m-%d}<br>Net New High: %{y:+d}개",
+            ), row=2, col=1)
+
+            fig_nnh.add_trace(go.Scatter(
+                x=df["date"],
+                y=df["nnh_ma20"],
+                line=dict(color="#EF9F27", width=1.5),
+                name="Net 20MA",
+                hovertemplate="%{x|%Y-%m-%d}<br>20MA: %{y:.1f}",
+            ), row=2, col=1)
+
+            fig_nnh.add_hline(y=0, line_dash="dot", line_color="gray", line_width=0.8, row=2, col=1)
+
+            for ann in fig_nnh["layout"]["annotations"]:
+                ann["font"] = dict(size=12, color="#9E9E9E")
+
+            fig_nnh.update_layout(
+                height=450,
+                margin=dict(t=25, b=40, l=0, r=0),
+                legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+                hovermode="x unified",
+                barmode="group",
+                bargap=0.15,
+            )
+        else:
+            fig_nnh = go.Figure()
+
+            # New High (+) Bar
+            fig_nnh.add_trace(go.Bar(
+                x=df["date"],
+                y=df["new_high_count"],
+                name="52W New High",
+                marker_color="#1D9E75",
+                hovertemplate="%{x|%Y-%m-%d}<br>New High: +%{y:,}개",
+            ))
+
+            # New Low (-) Bar
+            fig_nnh.add_trace(go.Bar(
+                x=df["date"],
+                y=-df["new_low_count"],
+                name="52W New Low",
+                marker_color="#E24B4A",
+                customdata=df["new_low_count"],
+                hovertemplate="%{x|%Y-%m-%d}<br>New Low: -%{customdata:,}개",
+            ))
+
+            # Net New High Line
+            fig_nnh.add_trace(go.Scatter(
+                x=df["date"],
+                y=df["net_new_high"],
+                line=dict(color="#378ADD", width=2),
+                name="Net New High",
+                hovertemplate="%{x|%Y-%m-%d}<br>Net New High: %{y:+d}개",
+            ))
+
+            # Net 20MA Line
+            fig_nnh.add_trace(go.Scatter(
+                x=df["date"],
+                y=df["nnh_ma20"],
+                line=dict(color="#EF9F27", width=1.5, dash="dot"),
+                name="Net 20MA",
+                hovertemplate="%{x|%Y-%m-%d}<br>20MA: %{y:.1f}",
+            ))
+
+            fig_nnh.add_hline(y=0, line_dash="dot", line_color="gray", line_width=0.8)
+
+            fig_nnh.update_layout(
+                height=340,
+                margin=dict(t=10, b=40, l=0, r=0),
+                legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                hovermode="x unified",
+                barmode="relative",
+                bargap=0.15,
+            )
+
         fig_nnh.update_xaxes(rangebreaks=rangebreaks)
         st.plotly_chart(fig_nnh, width='stretch')
 
@@ -3864,7 +4377,7 @@ def main() -> None:
         _show_breadth_tab(breadth_df)
 
     with tab3:
-        _show_sector_tab(sector_summary, rs_full)
+        _show_sector_tab(sector_summary, rs_full, theme_summary=theme_summary)
 
     with tab_ind:
         _show_industry_tab(screener, rs_full)
@@ -3873,7 +4386,7 @@ def main() -> None:
         _show_theme_tab(theme_summary, rs_full)
 
     with tab5:
-        _show_screener_tab(screener, tech_indicators)
+        _show_screener_tab(screener, tech_indicators, rs_full)
 
     with tab6:
         _show_portfolio_tab(

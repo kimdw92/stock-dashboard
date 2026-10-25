@@ -4,14 +4,15 @@
   "screener_1m_rs_pct_min": 75,
   "screener_rs_pct_filter_mode": "AND",
   "screener_slope_chk": false,
-  "screener_phase_filter": [],
-  "screener_ma_stack_filter": [
-    "정배열"
+  "screener_phase_filter": [
+    "강세"
   ],
+  "screener_ma_stack_filter": [],
+  "screener_rs_nh_filter": "3개월 내 신고가",
   "screener_stack_days_min": 0,
   "screener_etf_only": false,
   "screener_price_min": 7.0,
-  "screener_adv_min": 10.0,
+  "screener_adv_min": 50.0,
   "screener_mktcap_min": 2.0,
   "screener_atr_pct_min": 3.0,
   "screener_atr_multiple_max": 5.0,
