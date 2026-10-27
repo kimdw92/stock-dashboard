@@ -559,7 +559,7 @@ def build_stock_screener(
                      'latest_price', 'avg_dollar_volume', 'market_cap', 'parent_etf', 'theme']
         )
 
-    # ── 가격 / 거래대금 enrichment ────────────────────────────────────────────
+    # ── 가격 / 거래대금 / 이동평균선 enrichment ───────────────────────────────
     if prices_df is not None and not prices_df.empty:
         latest_p: pd.Series = prices_df.iloc[-1]
         stocks_df['latest_price'] = stocks_df['ticker'].map(latest_p)
@@ -573,9 +573,43 @@ def build_stock_screener(
             stocks_df['avg_dollar_volume'] = stocks_df['ticker'].map(avg_dv)
         else:
             stocks_df['avg_dollar_volume'] = np.nan
+
+        # ── 주가 이동평균선 (SMA 20, 50, 200) 및 이격도 ─────────────────────
+        sma_20 = prices_df.rolling(20, min_periods=20).mean().iloc[-1]
+        sma_50 = prices_df.rolling(50, min_periods=50).mean().iloc[-1]
+        sma_200 = prices_df.rolling(200, min_periods=200).mean().iloc[-1]
+
+        stocks_df['sma_20'] = stocks_df['ticker'].map(sma_20)
+        stocks_df['sma_50'] = stocks_df['ticker'].map(sma_50)
+        stocks_df['sma_200'] = stocks_df['ticker'].map(sma_200)
+
+        # 50일선 / 200일선 이격도 (%)
+        stocks_df['dist_pct_50sma'] = (
+            (stocks_df['latest_price'] - stocks_df['sma_50']) / stocks_df['sma_50'] * 100
+        ).round(2)
+        stocks_df['dist_pct_200sma'] = (
+            (stocks_df['latest_price'] - stocks_df['sma_200']) / stocks_df['sma_200'] * 100
+        ).round(2)
+
+        # 주요 이동평균 조건 불리언 플래그
+        stocks_df['price_above_sma20'] = stocks_df['latest_price'] > stocks_df['sma_20']
+        stocks_df['price_above_sma50'] = stocks_df['latest_price'] > stocks_df['sma_50']
+        stocks_df['price_above_sma200'] = stocks_df['latest_price'] > stocks_df['sma_200']
+        stocks_df['sma50_above_sma200'] = stocks_df['sma_50'] > stocks_df['sma_200']
+        stocks_df['sma20_above_sma50'] = stocks_df['sma_20'] > stocks_df['sma_50']
     else:
         stocks_df['latest_price'] = np.nan
         stocks_df['avg_dollar_volume'] = np.nan
+        stocks_df['sma_20'] = np.nan
+        stocks_df['sma_50'] = np.nan
+        stocks_df['sma_200'] = np.nan
+        stocks_df['dist_pct_50sma'] = np.nan
+        stocks_df['dist_pct_200sma'] = np.nan
+        stocks_df['price_above_sma20'] = False
+        stocks_df['price_above_sma50'] = False
+        stocks_df['price_above_sma200'] = False
+        stocks_df['sma50_above_sma200'] = False
+        stocks_df['sma20_above_sma50'] = False
 
     # ── 시가총액 enrichment ───────────────────────────────────────────────────
     if market_cap_s is not None and not market_cap_s.empty:
@@ -620,6 +654,9 @@ def build_stock_screener(
 
     cols = ['ticker', 'rs_rank', 'rs_percentile', 'rs_score', 'rs_slope',
             'latest_price', 'avg_dollar_volume', 'market_cap', 'industry', 'parent_etf', 'theme',
+            'sma_20', 'sma_50', 'sma_200', 'dist_pct_50sma', 'dist_pct_200sma',
+            'price_above_sma20', 'price_above_sma50', 'price_above_sma200',
+            'sma50_above_sma200', 'sma20_above_sma50',
             'rs_line_ema21', 'rs_line_phase', 'rs_line_3m_pct', 'rs_line_1m_pct',
             'rs_line_ma_stack', 'rs_line_stack_days', 'rs_line_sma20', 'rs_line_sma50',
             'rs_line_nh', 'rs_line_nh_in_3m',
@@ -815,8 +852,10 @@ def build_technical_indicators(
     """
     logger.info("기술적 지표 계산 중 (50SMA, ATR14)...")
 
-    # 1. 50SMA
-    sma_50 = prices.rolling(ma_window).mean()
+    # 1. SMA (20, 50, 200)
+    sma_20  = prices.rolling(20).mean()
+    sma_50  = prices.rolling(ma_window).mean()
+    sma_200 = prices.rolling(200).mean()
 
     # 2. ATR(14): True Range 기반 (high/low 있으면) 또는 종가 근사 (fallback)
     use_tr = (
@@ -843,17 +882,19 @@ def build_technical_indicators(
     # 3. ATR_pct (변동성 %)
     atr_pct = atr_14 / prices * 100
 
-    # 4. 50SMA로부터 거리 (%)
-    dist_pct_50sma = (prices - sma_50) / sma_50 * 100
+    # 4. SMA로부터 거리 (%)
+    dist_pct_50sma  = (prices - sma_50) / sma_50 * 100
+    dist_pct_200sma = (prices - sma_200) / sma_200 * 100
 
     # 5. ATR Multiple (ATR_pct=0이면 ZeroDivision 방지 위해 NaN 처리)
     atr_pct_safe = atr_pct.replace(0, np.nan)
     atr_multiple = dist_pct_50sma / atr_pct_safe
 
     # inf/-inf → NaN 처리
-    atr_pct        = atr_pct.replace([np.inf, -np.inf], np.nan)
-    dist_pct_50sma = dist_pct_50sma.replace([np.inf, -np.inf], np.nan)
-    atr_multiple   = atr_multiple.replace([np.inf, -np.inf], np.nan)
+    atr_pct         = atr_pct.replace([np.inf, -np.inf], np.nan)
+    dist_pct_50sma  = dist_pct_50sma.replace([np.inf, -np.inf], np.nan)
+    dist_pct_200sma = dist_pct_200sma.replace([np.inf, -np.inf], np.nan)
+    atr_multiple    = atr_multiple.replace([np.inf, -np.inf], np.nan)
 
     # ── Long format 변환: 각 지표를 melt 후 merge ────────────────────────────
     def _melt(df_wide: pd.DataFrame, value_name: str) -> pd.DataFrame:
@@ -863,11 +904,14 @@ def build_technical_indicators(
 
     result = _melt(prices, "close")
     for df_wide, name in [
-        (sma_50,         "sma_50"),
-        (atr_14,         "atr_14"),
-        (atr_pct,        "atr_pct"),
-        (dist_pct_50sma, "dist_pct_50sma"),
-        (atr_multiple,   "atr_multiple"),
+        (sma_20,          "sma_20"),
+        (sma_50,          "sma_50"),
+        (sma_200,         "sma_200"),
+        (atr_14,          "atr_14"),
+        (atr_pct,         "atr_pct"),
+        (dist_pct_50sma,  "dist_pct_50sma"),
+        (dist_pct_200sma, "dist_pct_200sma"),
+        (atr_multiple,    "atr_multiple"),
     ]:
         result = pd.merge(result, _melt(df_wide, name), on=["date", "ticker"], how="left")
 

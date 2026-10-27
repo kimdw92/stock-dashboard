@@ -8,6 +8,9 @@
     "강세"
   ],
   "screener_ma_stack_filter": [],
+  "screener_price_ma_filter": [
+    "주가 정배열 (Price > 50 > 200)"
+  ],
   "screener_rs_nh_filter": "3개월 내 신고가",
   "screener_stack_days_min": 0,
   "screener_etf_only": false,

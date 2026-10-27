@@ -34,6 +34,7 @@ _SCREENER_CFG_KEYS: list[str] = [
     "screener_slope_chk",
     "screener_phase_filter",
     "screener_ma_stack_filter",
+    "screener_price_ma_filter",
     "screener_rs_nh_filter",
     "screener_stack_days_min",
     "screener_etf_only",
@@ -2586,13 +2587,69 @@ def _show_screener_tab(
         except Exception:
             pass
 
+    # 주가 이동평균선(sma_20, sma_50, sma_200 등) 보강 — screener에 없으면 close_df로부터 계산
+    if "sma_50" not in screener.columns:
+        try:
+            close_df = load_close_prices()
+            if not close_df.empty:
+                latest_p = close_df.iloc[-1]
+                sma_20 = close_df.rolling(20, min_periods=20).mean().iloc[-1]
+                sma_50 = close_df.rolling(50, min_periods=50).mean().iloc[-1]
+                sma_200 = close_df.rolling(200, min_periods=200).mean().iloc[-1]
+
+                screener["sma_20"] = screener["ticker"].map(sma_20)
+                screener["sma_50"] = screener["ticker"].map(sma_50)
+                screener["sma_200"] = screener["ticker"].map(sma_200)
+
+                p = screener["latest_price"].fillna(screener["ticker"].map(latest_p))
+                screener["latest_price"] = p
+                screener["dist_pct_50sma"] = ((p - screener["sma_50"]) / screener["sma_50"] * 100).round(2)
+                screener["dist_pct_200sma"] = ((p - screener["sma_200"]) / screener["sma_200"] * 100).round(2)
+
+                screener["price_above_sma20"] = p > screener["sma_20"]
+                screener["price_above_sma50"] = p > screener["sma_50"]
+                screener["price_above_sma200"] = p > screener["sma_200"]
+                screener["sma50_above_sma200"] = screener["sma_50"] > screener["sma_200"]
+                screener["sma20_above_sma50"] = screener["sma_20"] > screener["sma_50"]
+        except Exception:
+            pass
+
+    # 주가 이동평균선 배열 상태 (price_ma_status) 벡터 계산
+    if "price_ma_status" not in screener.columns and "sma_50" in screener.columns and "latest_price" in screener.columns:
+        p = screener["latest_price"]
+        s20 = screener.get("sma_20", pd.Series(np.nan, index=screener.index))
+        s50 = screener["sma_50"]
+        s200 = screener.get("sma_200", pd.Series(np.nan, index=screener.index))
+
+        ma_conds = [
+            (p > s20) & (s20 > s50) & (s50 > s200) & s200.notna() & s20.notna(),
+            (p > s50) & (s50 > s200) & s200.notna(),
+            (s50 > s200) & (p < s50) & s200.notna(),
+            (s50 > s200) & s200.notna(),
+            (p < s50) & (s50 <= s200) & s200.notna(),
+            (s50 <= s200) & s200.notna(),
+            (p > s50),
+            (p <= s50),
+        ]
+        ma_choices = [
+            "완전 정배열",
+            "정배열",
+            "골든(50하회)",
+            "골든크로스",
+            "역배열",
+            "반등시도",
+            "50선 상회",
+            "50선 하회",
+        ]
+        screener["price_ma_status"] = np.select(ma_conds, ma_choices, default="")
+
     has_price   = "latest_price"      in screener.columns
     has_adv     = "avg_dollar_volume" in screener.columns
     has_mktcap  = "market_cap"        in screener.columns
     has_atr_pct = "atr_pct"           in screener.columns
 
     # ── 필터 컨트롤 행 1 ─────────────────────────────────────────────────────
-    f1, f2, f3, f4, f5 = st.columns([3, 2, 2.5, 2.5, 3])
+    f1, f2, f3, f4, f5 = st.columns([2.5, 1.8, 2.3, 3.4, 2.0])
 
     with f1:
         pct_min = st.slider(
@@ -2651,6 +2708,34 @@ def _show_screener_tab(
             index=nh_index,
             key="screener_rs_nh_filter",
             help="RS Line 50거래일(3개월) 신고가 필터.\n- 3개월 내: 최근 50거래일 내 1회 이상 RS 신고가 달성\n- 1개월 내: 최근 21거래일 내 RS 신고가 달성\n- 오늘: 당일 RS 신고가 달성",
+        )
+        price_ma_filter_options = [
+            "가격 > 50일 SMA",
+            "50 SMA > 200 SMA (골든크로스)",
+            "가격 > 200일 SMA",
+            "가격 > 20일 SMA",
+            "20 SMA > 50 SMA",
+            "주가 정배열 (Price > 50 > 200)",
+            "완전 정배열 (Price > 20 > 50 > 200)",
+            "가격 < 50일 SMA (50선 하회)",
+            "50 SMA < 200 SMA (데드크로스)",
+        ]
+        saved_price_ma = st.session_state.get("screener_price_ma_filter", [])
+        if not isinstance(saved_price_ma, list):
+            saved_price_ma = []
+        valid_price_ma = [x for x in saved_price_ma if x in price_ma_filter_options]
+        selected_price_ma = st.multiselect(
+            "주가 이동평균선 (Price MA)",
+            options=price_ma_filter_options,
+            default=valid_price_ma,
+            key="screener_price_ma_filter",
+            help="선택한 이동평균선 조건을 모두 충족하는 종목만 필터링합니다.\n"
+                 "- 가격 > 50일 SMA: 중기 상승 추세 (기관 지지선 상회)\n"
+                 "- 50 SMA > 200 SMA: 중장기 골든크로스 (상승 추세 정렬)\n"
+                 "- 가격 > 200일 SMA: 장기 상승 추세\n"
+                 "- 주가 정배열: Price > 50 SMA > 200 SMA\n"
+                 "- 완전 정배열: Price > 20 SMA > 50 SMA > 200 SMA\n"
+                 "- 비워두면 전체 표시.",
         )
     with f5:
         ticker_search = st.text_input(
@@ -2719,6 +2804,8 @@ def _show_screener_tab(
             "RS Slope":            "rs_slope",
             "정배열 유지일":        "rs_line_stack_days",
             "최근 RS 신고가순":     "rs_line_nh_days_ago",
+            "50 SMA 이격도순":     "dist_pct_50sma",
+            "200 SMA 이격도순":    "dist_pct_200sma",
         }
         sort_label = st.selectbox(
             "정렬 기준",
@@ -2808,6 +2895,46 @@ def _show_screener_tab(
     if ind_rank_max > 0 and "ind_rs_rank" in filtered.columns:
         filtered = filtered[filtered["ind_rs_rank"].fillna(999) <= ind_rank_max]
 
+    # ── 주가 이동평균선 필터 적용 ─────────────────────────────────────────────
+    if selected_price_ma:
+        for opt in selected_price_ma:
+            if opt == "가격 > 50일 SMA":
+                if "sma_50" in filtered.columns and "latest_price" in filtered.columns:
+                    filtered = filtered[filtered["latest_price"].fillna(0) > filtered["sma_50"].fillna(np.inf)]
+            elif opt == "50 SMA > 200 SMA (골든크로스)":
+                if "sma_50" in filtered.columns and "sma_200" in filtered.columns:
+                    filtered = filtered[filtered["sma_50"].fillna(0) > filtered["sma_200"].fillna(np.inf)]
+            elif opt == "가격 > 200일 SMA":
+                if "sma_200" in filtered.columns and "latest_price" in filtered.columns:
+                    filtered = filtered[filtered["latest_price"].fillna(0) > filtered["sma_200"].fillna(np.inf)]
+            elif opt == "가격 > 20일 SMA":
+                if "sma_20" in filtered.columns and "latest_price" in filtered.columns:
+                    filtered = filtered[filtered["latest_price"].fillna(0) > filtered["sma_20"].fillna(np.inf)]
+            elif opt == "20 SMA > 50 SMA":
+                if "sma_20" in filtered.columns and "sma_50" in filtered.columns:
+                    filtered = filtered[filtered["sma_20"].fillna(0) > filtered["sma_50"].fillna(np.inf)]
+            elif opt == "주가 정배열 (Price > 50 > 200)":
+                if "sma_50" in filtered.columns and "sma_200" in filtered.columns and "latest_price" in filtered.columns:
+                    cond = (
+                        (filtered["latest_price"].fillna(0) > filtered["sma_50"].fillna(np.inf))
+                        & (filtered["sma_50"].fillna(0) > filtered["sma_200"].fillna(np.inf))
+                    )
+                    filtered = filtered[cond]
+            elif opt == "완전 정배열 (Price > 20 > 50 > 200)":
+                if "sma_20" in filtered.columns and "sma_50" in filtered.columns and "sma_200" in filtered.columns and "latest_price" in filtered.columns:
+                    cond = (
+                        (filtered["latest_price"].fillna(0) > filtered["sma_20"].fillna(np.inf))
+                        & (filtered["sma_20"].fillna(0) > filtered["sma_50"].fillna(np.inf))
+                        & (filtered["sma_50"].fillna(0) > filtered["sma_200"].fillna(np.inf))
+                    )
+                    filtered = filtered[cond]
+            elif opt == "가격 < 50일 SMA (50선 하회)":
+                if "sma_50" in filtered.columns and "latest_price" in filtered.columns:
+                    filtered = filtered[filtered["latest_price"].fillna(np.inf) < filtered["sma_50"].fillna(0)]
+            elif opt == "50 SMA < 200 SMA (데드크로스)":
+                if "sma_50" in filtered.columns and "sma_200" in filtered.columns:
+                    filtered = filtered[filtered["sma_50"].fillna(np.inf) < filtered["sma_200"].fillna(0)]
+
     # ── 정렬 ──────────────────────────────────────────────────────────────────
     sort_target = sort_col if sort_col in filtered.columns else "rs_percentile"
     is_ascending = (sort_target == "rs_line_nh_days_ago")
@@ -2822,6 +2949,8 @@ def _show_screener_tab(
     caption_parts = []
     if selected_phase:
         caption_parts.append(f"Phase 필터: {', '.join(selected_phase)}")
+    if selected_price_ma:
+        caption_parts.append(f"주가 MA: {', '.join(selected_price_ma)}")
     if rs_nh_filter != "전체":
         caption_parts.append(f"RS Line 신고가: {rs_nh_filter}")
     if caption_parts:
@@ -2837,8 +2966,11 @@ def _show_screener_tab(
         "rs_percentile", "rs_1m_pct", "rs_3m_pct",
         "rs_line_phase", "rs_line_ma_stack", "rs_line_stack_days",
         "rs_line_nh_3m", "rs_line_nh_days_ago",
+        "price_ma_status",
+        "dist_pct_50sma", "dist_pct_200sma",
+        "latest_price", "sma_50", "sma_200",
         "atr_multiple",
-        "latest_price", "adv_m", "mktcap_b", "atr_pct",
+        "adv_m", "mktcap_b", "atr_pct",
         "parent_etf", "theme",
     ] if c in filtered.columns]
 
@@ -2858,6 +2990,22 @@ def _show_screener_tab(
         "price_chg_3m_pct": st.column_config.NumberColumn("3M 등락률", format="%.2f%%"),
         "price_chg_6m_pct": st.column_config.NumberColumn("6M 등락률", format="%.2f%%"),
         "price_chg_1y_pct": st.column_config.NumberColumn("1Y 등락률", format="%.2f%%"),
+
+        "price_ma_status": st.column_config.TextColumn(
+            "주가 MA", help="주가 이동평균선 배열 상태 (완전 정배열, 정배열, 골든크로스, 역배열 등)"
+        ),
+        "dist_pct_50sma": st.column_config.NumberColumn(
+            "50 SMA 이격도", format="%+.1f%%", help="50일 이동평균선 대비 이격률 ((Price - 50SMA) / 50SMA * 100)"
+        ),
+        "dist_pct_200sma": st.column_config.NumberColumn(
+            "200 SMA 이격도", format="%+.1f%%", help="200일 이동평균선 대비 이격률 ((Price - 200SMA) / 200SMA * 100)"
+        ),
+        "sma_50": st.column_config.NumberColumn(
+            "50 SMA ($)", format="$%.2f", help="50일 단순이동평균 (중기 기관 지지선)"
+        ),
+        "sma_200": st.column_config.NumberColumn(
+            "200 SMA ($)", format="$%.2f", help="200일 단순이동평균 (장기 추세선)"
+        ),
 
         "atr_pct":          st.column_config.NumberColumn("ATR%",              format="%.2f%%"),
         "atr_multiple":     st.column_config.NumberColumn("50일선 이격도(ATR)",  format="%.2f"),
