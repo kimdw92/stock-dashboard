@@ -51,14 +51,22 @@ NASDAQ FTP 서버와 Yahoo Finance로부터 대규모 OHLCV 시세 데이터를 
          - technical_indicators.parquet (50 SMA, 14 ATR, ATR Multiple)
           │
           ▼
-[3단계: 선택적 계좌 수집]
+[3단계: 시장 브리핑 생성]
+  market_briefing.py (.env의 GEMINI_API_KEY 활용)
+    ├─ Google News RSS 헤드라인 수집
+    ├─ x_collector.py (Playwright 기반 FinTwit 트레이더 트윗 수집, traders.json 참조)
+    ├─ 정량 지표(지수 등락률, RS 주도 섹터, Breadth Score) 결합
+    └─ output/market_briefing.json 저장 (외신 요약 + 트레이더 심리 브리핑)
+          │
+          ▼
+[4단계: 선택적 계좌 수집]
   toss_collector.py (.env 자격증명 필요)
     └─ output/portfolio_snapshot.parquet & output/trade_history.parquet
           │
           ▼
-[4단계: 대시보드 시각화 & 인터랙션]
+[5단계: 대시보드 시각화 & 인터랙션]
   app.py (Streamlit 대시보드)
-    - output/ 디렉터리의 분석 결과 시각화
+    - output/ 디렉터리의 분석 결과 시각화 (Daily Summary 최상단 AI 시장 브리핑 렌더링)
     - .intermediate/ 디렉터리의 원본 종가/ETF 메타데이터 직접 참조
     - screener_config.json에 사용자 필터 설정 영속화
 ```
@@ -74,13 +82,14 @@ NASDAQ FTP 서버와 Yahoo Finance로부터 대규모 OHLCV 시세 데이터를 
 ## 주요 모듈 및 상세 설명
 
 ### 1. `run_pipeline.py` (통합 파이프라인 진입점)
-전체 파이프라인을 4단계로 순차 제어합니다.
-* `[1/4] 데이터 다운로드` (`data_downloader.py`)
-* `[2/4] RS 엔진 계산` (`rs_engine.py`)
-* `[3/4] 계좌 수집` (`toss_collector.py`)
-* `[4/4] 대시보드 실행` (`app.py`)
+전체 파이프라인을 5단계로 순차 제어합니다.
+* `[1/5] 데이터 다운로드` (`data_downloader.py`)
+* `[2/5] RS 엔진 계산` (`rs_engine.py`)
+* `[3/5] 시장 브리핑 생성` (`market_briefing.py`)
+* `[4/5] 계좌 수집` (`toss_collector.py`)
+* `[5/5] 대시보드 실행` (`app.py`)
 
-각 단계별 스킵 플래그를 제공하여 유연하게 실행할 수 있습니다.
+각 단계별 스킵 플래그(`--skip-download`, `--skip-engine`, `--skip-briefing`, `--skip-account`, `--no-app`)를 제공하여 유연하게 실행할 수 있습니다.
 
 ### 2. `data_loader.py` (다운로드 및 캐시 엔진)
 프로젝트에서 가장 복잡하고 정교한 시세 다운로드 계층입니다 (약 2,000줄).

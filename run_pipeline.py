@@ -2,9 +2,10 @@
 RS Dashboard 통합 파이프라인
 
 실행:
-  python run_pipeline.py                  # 전체 실행 (다운로드 → RS 계산 → 계좌 수집 → 대시보드)
+  python run_pipeline.py                  # 전체 실행 (다운로드 → RS 계산 → 브리핑 → 계좌 수집 → 대시보드)
   python run_pipeline.py --skip-download  # 다운로드 건너뛰기
   python run_pipeline.py --skip-engine    # RS 계산 건너뛰기
+  python run_pipeline.py --skip-briefing  # 시장 브리핑 생성 건너뛰기
   python run_pipeline.py --skip-account   # 계좌 수집 건너뛰기 (.env 미설정 시 필요)
   python run_pipeline.py --no-app         # 대시보드 실행 없이 데이터 갱신만
 
@@ -69,6 +70,11 @@ def _step_engine() -> None:
     run_pipeline(config)
 
 
+def _step_briefing() -> None:
+    from market_briefing import run_briefing
+    run_briefing()
+
+
 def _step_account() -> None:
     # 인자 없이 호출한다. 첫 실행은 output/trade_history.parquet이 없어 자동으로
     # 전체 기간을 조회하고(_incremental_from_date()가 None), 이후로는 증분만 받는다.
@@ -94,23 +100,25 @@ def main() -> None:
         epilog=(
             "예시:\n"
             "  python run_pipeline.py                  전체 실행\n"
-            "  python run_pipeline.py --skip-download  RS 계산 + 계좌 수집 + 대시보드\n"
+            "  python run_pipeline.py --skip-download  RS 계산 + 브리핑 + 계좌 수집 + 대시보드\n"
             "  python run_pipeline.py --skip-account   계좌 수집 제외 (.env 미설정 시)\n"
             "  python run_pipeline.py --no-app         데이터 갱신만 (대시보드 미실행)\n"
         ),
     )
     parser.add_argument("--skip-download", action="store_true", help="데이터 다운로드 건너뜀")
     parser.add_argument("--skip-engine",   action="store_true", help="RS 엔진 계산 건너뜀")
+    parser.add_argument("--skip-briefing", action="store_true", help="시장 브리핑 생성 건너뜀")
     parser.add_argument("--skip-account",  action="store_true",
                         help="계좌 수집 건너뜀 (.env 자격증명이 없으면 필요)")
     parser.add_argument("--no-app",        action="store_true", help="대시보드 실행 안 함")
     args = parser.parse_args()
 
     steps = [
-        ("[1/4] 데이터 다운로드  (data_downloader.py)", _step_download, args.skip_download),
-        ("[2/4] RS 엔진 계산     (rs_engine.py)",       _step_engine,   args.skip_engine),
-        ("[3/4] 계좌 수집        (toss_collector.py)",  _step_account,  args.skip_account),
-        ("[4/4] 대시보드 실행    (app.py)",              _step_app,      args.no_app),
+        ("[1/5] 데이터 다운로드  (data_downloader.py)",  _step_download,  args.skip_download),
+        ("[2/5] RS 엔진 계산     (rs_engine.py)",        _step_engine,    args.skip_engine),
+        ("[3/5] 시장 브리핑 생성 (market_briefing.py)",  _step_briefing,  args.skip_briefing),
+        ("[4/5] 계좌 수집        (toss_collector.py)",   _step_account,   args.skip_account),
+        ("[5/5] 대시보드 실행    (app.py)",               _step_app,       args.no_app),
     ]
 
     pipeline_start = time.time()

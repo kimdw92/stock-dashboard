@@ -176,7 +176,17 @@ def load_theme_summary() -> pd.DataFrame:
 @st.cache_data
 def load_screener() -> pd.DataFrame:
     try:
-        return pd.read_parquet(OUTPUT_DIR / "stock_screener.parquet")
+        df = pd.read_parquet(OUTPUT_DIR / "stock_screener.parquet")
+        if "sector" not in df.columns:
+            s_path = INTERMEDIATE_DIR / "sector_info.parquet"
+            if s_path.exists():
+                try:
+                    s_info = pd.read_parquet(s_path)
+                    if "sector" in s_info.columns:
+                        df["sector"] = df["ticker"].map(s_info["sector"])
+                except Exception:
+                    pass
+        return df
     except Exception as e:
         st.error(f"stock_screener.parquet 로드 실패: {e}")
         st.stop()
@@ -852,6 +862,222 @@ def _render_ranking_table(df: pd.DataFrame, height: int = 500, exclude_cols: lis
         st.dataframe(styled, width='stretch', hide_index=True, column_config=col_config, height=height)
     else:
         st.dataframe(display_df, width='stretch', hide_index=True, column_config=col_config, height=height)
+
+# ─── Market Briefing 렌더링 ───────────────────────────────────────────────────
+
+def _refresh_briefing_callback() -> None:
+    """'브리핑 새로고침' 버튼 콜백: 강제 재생성 후 세션에 결과 저장."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        # X 세션이 있으면 백그라운드로 트윗 수집 먼저 시도
+        try:
+            from x_collector import is_session_valid, collect_trader_tweets
+            if is_session_valid():
+                collect_trader_tweets(max_tweets_per_trader=2)
+        except Exception:
+            pass
+
+        from market_briefing import generate_briefing
+        result = generate_briefing(force=True)
+        st.session_state["_briefing_data"] = result
+    except Exception as e:
+        st.session_state["_briefing_error"] = str(e)
+
+
+def _render_market_briefing() -> None:
+    """시장 브리핑 섹션을 Daily Summary 탭 최상단에 렌더링한다.
+
+    output/market_briefing.json을 로드하여
+    [외신 뉴스 브리핑] 및 [FinTwit 트레이더 심리] 탭을 렌더링한다.
+    """
+    briefing = st.session_state.get("_briefing_data")
+    if briefing is None:
+        try:
+            from market_briefing import load_briefing
+            briefing = load_briefing()
+        except ImportError:
+            return
+
+    if briefing is None:
+        st.info(
+            "시장 브리핑 데이터가 없습니다. "
+            "`python market_briefing.py` 또는 `python run_pipeline.py`를 실행하세요."
+        )
+        return
+
+    # 에러 표시
+    if st.session_state.get("_briefing_error"):
+        st.warning(f"브리핑 갱신 오류: {st.session_state.pop('_briefing_error')}")
+
+    summary = briefing.get("summary")
+    headlines = briefing.get("headlines", [])
+    generated_at = briefing.get("generated_at", "")
+    trader_briefing = briefing.get("trader_briefing")
+    error = briefing.get("error")
+
+    # 타임스탬프 포맷
+    timestamp_display = ""
+    if generated_at:
+        try:
+            from datetime import datetime, timezone, timedelta
+            KST = timezone(timedelta(hours=9))
+            gen_dt = datetime.fromisoformat(generated_at).astimezone(KST)
+            timestamp_display = gen_dt.strftime("%Y-%m-%d %H:%M KST")
+        except (ValueError, TypeError):
+            timestamp_display = generated_at
+
+    # ── 상단 헤더 & 새로고침 버튼 ─────────────────────────────────────────
+    col_title, col_btn = st.columns([5, 1])
+    with col_title:
+        st.markdown(f"#### 🌐 AI 시장 종합 브리핑  `{timestamp_display}`")
+    with col_btn:
+        st.button(
+            "🔄 새로고침",
+            key="btn_refresh_briefing",
+            on_click=_refresh_briefing_callback,
+            help="외신 뉴스 및 X 트레이더 트윗을 새로 수집하고 AI 요약을 갱신합니다.",
+        )
+
+    subtab_news, subtab_trader = st.tabs([
+        "📰 외신 뉴스 브리핑 (Fact & Macro)",
+        "🐦 FinTwit 트레이더 심리 (Trader View)",
+    ])
+
+    # ── 탭 1: 외신 뉴스 브리핑 ────────────────────────────────────────────
+    with subtab_news:
+        if summary:
+            lines = summary.strip().split("\n")
+            li_items = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith(("- ", "* ", "• ")):
+                    stripped = stripped[2:].strip()
+                if stripped:
+                    li_items.append(f"<li>{html.escape(stripped)}</li>")
+
+            body_html = "<ul>" + "".join(li_items) + "</ul>" if li_items else html.escape(summary)
+            card_html = f"""
+            <div class="briefing-card">
+              <div class="briefing-header">
+                <div class="briefing-title">🏛️ 주요 외신 매크로 시황 요약</div>
+                <div class="briefing-timestamp">Reuters / Bloomberg / WSJ</div>
+              </div>
+              <div class="briefing-body">{body_html}</div>
+            </div>
+            """
+            st.markdown(card_html, unsafe_allow_html=True)
+        elif error:
+            st.warning(f"브리핑 생성 오류: {error}")
+        elif headlines:
+            st.info("AI 요약이 없습니다. `.env`에 `GEMINI_API_KEY`를 설정하면 AI 브리핑이 생성됩니다.")
+
+        if headlines:
+            with st.expander(f"📰 주요 외신 헤드라인 ({len(headlines)}건)", expanded=False):
+                items_html_parts: list[str] = []
+                for h in headlines:
+                    source = html.escape(h.get("source", ""))
+                    title = html.escape(h.get("title", ""))
+                    link = h.get("link", "")
+                    pub_date = h.get("pub_date", "")
+
+                    time_display = ""
+                    if pub_date:
+                        try:
+                            from email.utils import parsedate_to_datetime
+                            dt = parsedate_to_datetime(pub_date)
+                            time_display = dt.strftime("%H:%M GMT")
+                        except Exception:
+                            time_display = pub_date[:16] if len(pub_date) > 16 else pub_date
+
+                    title_html = (
+                        f'<a href="{html.escape(link)}" target="_blank">{title}</a>'
+                        if link else title
+                    )
+                    items_html_parts.append(
+                        f'<div class="headline-item">'
+                        f'  <span class="headline-source">{source}</span>'
+                        f'  <span class="headline-title">{title_html}</span>'
+                        f'  <span class="headline-time">{html.escape(time_display)}</span>'
+                        f'</div>'
+                    )
+
+                st.markdown(
+                    f'<div class="headline-list">{"".join(items_html_parts)}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── 탭 2: FinTwit 트레이더 심리 ─────────────────────────────────────────
+    with subtab_trader:
+        if trader_briefing:
+            stance = trader_briefing.get("sentiment_stance", "중립")
+            color = trader_briefing.get("sentiment_color", "warning")
+            cash = trader_briefing.get("cash_guidance", "")
+            bullets = trader_briefing.get("summary_bullets", [])
+            tickers = trader_briefing.get("mentioned_tickers", [])
+            raw_tweets = trader_briefing.get("tweets", [])
+            total_traders = trader_briefing.get("total_traders", len(raw_tweets))
+
+            # 심리 배너
+            if color == "success":
+                st.success(f"🟢 **트레이더 종합 심리: {stance}** — {cash}")
+            elif color == "danger":
+                st.error(f"🔴 **트레이더 종합 심리: {stance}** — {cash}")
+            else:
+                st.warning(f"🟡 **트레이더 종합 심리: {stance}** — {cash}")
+
+            # 티커 뱃지
+            if tickers:
+                ticker_badges = " ".join([f"`${t.replace('$', '')}`" for t in tickers])
+                st.markdown(f"**🔥 트레이더 언급 주요 티커:** {ticker_badges}")
+
+            # 핵심 요약 리스트
+            if bullets:
+                b_html = "".join([f"<li>{html.escape(b)}</li>" for b in bullets])
+                card_html = f"""
+                <div class="briefing-card" style="border-color: #d1d5db; background: linear-gradient(135deg, #ffffff 0%, #f9fafb 100%);">
+                  <div class="briefing-header">
+                    <div class="briefing-title">🎯 모멘텀 트레이더 실전 코멘트 요약</div>
+                    <div class="briefing-timestamp">Top {total_traders} Traders</div>
+                  </div>
+                  <div class="briefing-body"><ul>{b_html}</ul></div>
+                </div>
+                """
+                st.markdown(card_html, unsafe_allow_html=True)
+
+            # 트윗 원문 아코디언
+            if raw_tweets:
+                with st.expander(f"💬 트레이더 원문 트윗 ({len(raw_tweets)}건)", expanded=False):
+                    for tw in raw_tweets:
+                        h = html.escape(tw.get("handle", ""))
+                        nm = html.escape(tw.get("name", h))
+                        txt = html.escape(tw.get("text", ""))
+                        lk = tw.get("link", "")
+                        lk_html = f'<a href="{html.escape(lk)}" target="_blank" style="font-size: 11px; color: #2563eb;">[원문 보기 ↗]</a>' if lk else ""
+                        st.markdown(
+                            f'<div style="padding: 6px 10px; margin-bottom: 6px; border-left: 3px solid #60a5fa; background: #f8fafc; border-radius: 2px;">'
+                            f'  <strong>{nm}</strong> <span style="color: #64748b; font-size: 11px;">@{h}</span> {lk_html}'
+                            f'  <div style="font-size: 12.5px; color: #334155; margin-top: 2px; line-height: 1.5;">{txt}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+        else:
+            # 트레이더 브리핑 미설정 시 안내 카드
+            st.info(
+                "🐦 **X(트위터) 트레이더 심리 브리핑 연동 안내**\n\n"
+                "Mark Minervini, Dan Zanger, Kristjan Qullamaggie 등 세계적인 모멘텀 트레이더 10인의 최근 게시글을 자동 분석합니다.\n\n"
+                "**설정 방법 (최초 1회):**\n"
+                "1. 터미널(PowerShell)에서 아래 명령어를 실행하여 브라우저 창에서 X에 로그인하세요:\n"
+                "   ```powershell\n"
+                "   python x_collector.py --login\n"
+                "   ```\n"
+                "2. 로그인이 완료되면 세션이 로컬(`.cache/x_session.json`)에 저장되며, 이후부터는 헤드리스(백그라운드)로 자동 수집됩니다.\n"
+                "3. 대상 트레이더는 프로젝트 루트의 `traders.json` 파일에서 언제든 자유롭게 추가/수정하실 수 있습니다."
+            )
+
+    st.divider()
+
 
 
 # ─── Daily Summary 헬퍼 함수 ──────────────────────────────────────────────────
@@ -2539,6 +2765,228 @@ def _show_theme_tab(theme_summary: pd.DataFrame, rs_full: pd.DataFrame) -> None:
                 st.info("RS Line 데이터가 없습니다.")
 
 
+def _render_screener_distribution_charts(filtered: pd.DataFrame) -> None:
+    """종목 스크리너 필터링 결과의 Sector 및 Industry 비중 통계 차트 (도넛/바 차트 및 계층 트리맵)."""
+    if filtered.empty:
+        return
+
+    with st.expander("📊 섹터 및 산업(업종) 비중 통계", expanded=True):
+        # 1. 시가총액 가중치 적용 가능 여부 확인
+        has_mc = "market_cap" in filtered.columns and filtered["market_cap"].dropna().gt(0).any()
+
+        c_opt1, c_opt2, c_opt3 = st.columns([2.5, 3.0, 2.5])
+        with c_opt1:
+            metric_options = ["종목 수 (Count)"]
+            if has_mc:
+                metric_options.append("시가총액 (Market Cap)")
+            metric_choice = st.radio(
+                "집계 기준",
+                options=metric_options,
+                index=0,
+                horizontal=True,
+                key="screener_dist_metric",
+            )
+        use_mktcap = (metric_choice == "시가총액 (Market Cap)")
+
+        with c_opt2:
+            view_mode = st.radio(
+                "시각화 유형",
+                options=["도넛 & 가로 막대 차트", "계층 트리맵 (Treemap)"],
+                index=0,
+                horizontal=True,
+                key="screener_dist_view_mode",
+            )
+
+        with c_opt3:
+            if view_mode == "도넛 & 가로 막대 차트":
+                top_n = st.selectbox(
+                    "상위 산업 표시 개수",
+                    options=[10, 15, 20, 30],
+                    index=1,
+                    key="screener_dist_top_n",
+                )
+            else:
+                top_n = 15
+
+        # 데이터 복사 및 결측치 처리
+        df_dist = filtered.copy()
+        df_dist["sector_clean"] = (
+            df_dist["sector"].fillna("(미분류)").astype(str).str.strip().replace("", "(미분류)")
+            if "sector" in df_dist.columns else "(미분류)"
+        )
+        df_dist["industry_clean"] = (
+            df_dist["industry"].fillna("(미분류)").astype(str).str.strip().replace("", "(미분류)")
+            if "industry" in df_dist.columns else "(미분류)"
+        )
+
+        if use_mktcap:
+            df_dist["val"] = df_dist["market_cap"].fillna(0)
+            total_val = df_dist["val"].sum() / 1e9
+            total_label = f"${total_val:,.1f}B"
+        else:
+            df_dist["val"] = 1
+            total_val = len(df_dist)
+            total_label = f"{total_val:,}개"
+
+        if total_val <= 0:
+            st.info("유효한 비중 집계 데이터가 없습니다.")
+            return
+
+        # 섹터별 집계
+        sec_agg = df_dist.groupby("sector_clean")["val"].sum().reset_index()
+        sec_agg["pct"] = (sec_agg["val"] / sec_agg["val"].sum() * 100).round(1)
+        sec_agg = sec_agg.sort_values("val", ascending=False).reset_index(drop=True)
+
+        # 산업별 집계
+        ind_agg = df_dist.groupby("industry_clean")["val"].sum().reset_index()
+        ind_agg["pct"] = (ind_agg["val"] / ind_agg["val"].sum() * 100).round(1)
+        ind_agg = ind_agg.sort_values("val", ascending=False).reset_index(drop=True)
+
+        # 상단 요약 카드 (Top 1 섹터, Top 1 산업, 섹터 수, 산업 수)
+        top_sec_name = sec_agg.iloc[0]["sector_clean"] if not sec_agg.empty else "-"
+        top_sec_pct = sec_agg.iloc[0]["pct"] if not sec_agg.empty else 0
+        top_ind_name = ind_agg.iloc[0]["industry_clean"] if not ind_agg.empty else "-"
+        top_ind_pct = ind_agg.iloc[0]["pct"] if not ind_agg.empty else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("1위 섹터", f"{top_sec_name}", f"{top_sec_pct:.1f}%")
+        with m2:
+            st.metric("1위 산업", f"{top_ind_name}", f"{top_ind_pct:.1f}%")
+        with m3:
+            st.metric("분류된 섹터 수", f"{len(sec_agg):,}개", f"전체 {total_label}")
+        with m4:
+            st.metric("분류된 산업 수", f"{len(ind_agg):,}개")
+
+        # ── 차트 렌더링 ────────────────────────────────────────────────────────
+        if view_mode == "도넛 & 가로 막대 차트":
+            col_left, col_right = st.columns([1, 1])
+
+            # 좌측: 섹터 비중 도넛 차트
+            with col_left:
+                st.markdown(f"**섹터(Sector) 비중 분포** (총 {len(sec_agg)}개)")
+                if use_mktcap:
+                    sec_agg["display_val"] = (sec_agg["val"] / 1e9).round(2)
+                    hover_tmpl = "<b>%{label}</b><br>시가총액: $%{value:.2f}B<br>비중: %{percent}<extra></extra>"
+                else:
+                    sec_agg["display_val"] = sec_agg["val"]
+                    hover_tmpl = "<b>%{label}</b><br>종목 수: %{value:,}개<br>비중: %{percent}<extra></extra>"
+
+                fig_donut = go.Figure(
+                    data=[
+                        go.Pie(
+                            labels=sec_agg["sector_clean"],
+                            values=sec_agg["display_val"],
+                            hole=0.42,
+                            textinfo="percent+label",
+                            textposition="inside",
+                            insidetextorientation="radial",
+                            hovertemplate=hover_tmpl,
+                            marker=dict(colors=px.colors.qualitative.Plotly + px.colors.qualitative.Dark24),
+                        )
+                    ]
+                )
+                fig_donut.update_layout(
+                    showlegend=False,
+                    margin=dict(t=20, l=10, r=10, b=20),
+                    height=380,
+                    annotations=[
+                        dict(
+                            text=f"<b>합계</b><br>{total_label}",
+                            x=0.5, y=0.5,
+                            font_size=13,
+                            showarrow=False,
+                        )
+                    ],
+                )
+                st.plotly_chart(fig_donut, width='stretch')
+
+            # 우측: 상위 산업 가로 막대 차트
+            with col_right:
+                st.markdown(f"**상위 산업(Industry) 비중 Top {min(top_n, len(ind_agg))}** (전체 {len(ind_agg)}개 중)")
+                top_ind = ind_agg.head(top_n).iloc[::-1]  # 위쪽이 큰 값이 오도록 반전
+                if use_mktcap:
+                    top_ind_val = (top_ind["val"] / 1e9).round(2)
+                    bar_text = [f"${v:.1f}B ({p:.1f}%)" for v, p in zip(top_ind_val, top_ind["pct"])]
+                    bar_hover = "<b>%{y}</b><br>시가총액: $%{x:.2f}B<br>비중: %{customdata:.1f}%<extra></extra>"
+                else:
+                    top_ind_val = top_ind["val"]
+                    bar_text = [f"{int(v)}개 ({p:.1f}%)" for v, p in zip(top_ind_val, top_ind["pct"])]
+                    bar_hover = "<b>%{y}</b><br>종목 수: %{x:,}개<br>비중: %{customdata:.1f}%<extra></extra>"
+
+                fig_bar = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=top_ind_val,
+                            y=top_ind["industry_clean"],
+                            orientation="h",
+                            text=bar_text,
+                            textposition="auto",
+                            customdata=top_ind["pct"],
+                            hovertemplate=bar_hover,
+                            marker=dict(
+                                color=top_ind["pct"],
+                                colorscale="Blues",
+                                showscale=False,
+                            ),
+                        )
+                    ]
+                )
+                fig_bar.update_layout(
+                    xaxis_title="시가총액 ($B)" if use_mktcap else "종목 수 (개)",
+                    yaxis=dict(automargin=True),
+                    margin=dict(t=20, l=10, r=10, b=20),
+                    height=380,
+                    bargap=0.25,
+                )
+                st.plotly_chart(fig_bar, width='stretch')
+
+        else:
+            # 계층 트리맵 (Treemap)
+            st.markdown(f"**섹터 ➔ 산업 계층 트리맵 (면적: {metric_choice})** — 클릭 시 섹터별 세부 산업 확대")
+            if use_mktcap:
+                df_dist["val_scaled"] = (df_dist["val"] / 1e9).round(3)
+                tree_agg = (
+                    df_dist.groupby(["sector_clean", "industry_clean"])["val_scaled"]
+                    .sum()
+                    .reset_index()
+                )
+                tree_agg.columns = ["sector", "industry", "market_cap_b"]
+                fig_tree = px.treemap(
+                    tree_agg,
+                    path=["sector", "industry"],
+                    values="market_cap_b",
+                    color="sector",
+                    color_discrete_sequence=px.colors.qualitative.Plotly + px.colors.qualitative.Dark24,
+                )
+                fig_tree.data[0].hovertemplate = (
+                    "<b>%{label}</b><br>상위: %{parent}<br>시가총액: $%{value:.2f}B<br>비중: %{percentRoot:.1%}<extra></extra>"
+                )
+            else:
+                tree_agg = (
+                    df_dist.groupby(["sector_clean", "industry_clean"])
+                    .size()
+                    .reset_index(name="count")
+                )
+                tree_agg.columns = ["sector", "industry", "count"]
+                fig_tree = px.treemap(
+                    tree_agg,
+                    path=["sector", "industry"],
+                    values="count",
+                    color="sector",
+                    color_discrete_sequence=px.colors.qualitative.Plotly + px.colors.qualitative.Dark24,
+                )
+                fig_tree.data[0].hovertemplate = (
+                    "<b>%{label}</b><br>상위: %{parent}<br>종목 수: %{value:,}개<br>비중: %{percentRoot:.1%}<extra></extra>"
+                )
+
+            fig_tree.update_layout(
+                margin=dict(t=30, l=10, r=10, b=10),
+                height=480,
+            )
+            st.plotly_chart(fig_tree, width='stretch')
+
+
 # ─── Tab 3: 종목 스크리너 ─────────────────────────────────────────────────────
 def _show_screener_tab(
     screener: pd.DataFrame,
@@ -2558,6 +3006,17 @@ def _show_screener_tab(
     if screener.empty:
         st.info("스크리너 데이터가 없습니다.")
         return
+
+    # sector 컬럼 보강 — screener에 없으면 intermediate/sector_info.parquet에서 매핑
+    if "sector" not in screener.columns:
+        s_path = INTERMEDIATE_DIR / "sector_info.parquet"
+        if s_path.exists():
+            try:
+                s_info = pd.read_parquet(s_path)
+                if "sector" in s_info.columns:
+                    screener["sector"] = screener["ticker"].map(s_info["sector"])
+            except Exception:
+                pass
 
     # atr_pct 보강 — screener에 없으면 tech_indicators 최신 날짜 기준으로 join
     if "atr_pct" not in screener.columns and tech_indicators is not None and not tech_indicators.empty:
@@ -2959,8 +3418,11 @@ def _show_screener_tab(
             f"{' | '.join(caption_parts)} → {sort_label} 기준 {sort_dir_str} 정렬"
         )
 
+    # ── 섹터 & 산업 비중 통계 차트 ─────────────────────────────────────────────
+    _render_screener_distribution_charts(filtered)
+
     display_cols = [c for c in [
-        "ticker", "industry", "ind_rs_rank",
+        "ticker", "sector", "industry", "ind_rs_rank",
         "price_chg_pct", "price_chg_5d_pct",
         "price_chg_1m_pct", "price_chg_3m_pct", "price_chg_6m_pct", "price_chg_1y_pct",
         "rs_percentile", "rs_1m_pct", "rs_3m_pct",
@@ -2975,6 +3437,7 @@ def _show_screener_tab(
     ] if c in filtered.columns]
 
     col_config = {
+        "sector":        st.column_config.TextColumn("섹터"),
         "rs_rank":       st.column_config.NumberColumn("RS 순위",     format="%d"),
         "rs_percentile": st.column_config.ProgressColumn(
             "RS 백분위", min_value=0, max_value=100, format="%.1f%%"
@@ -4384,6 +4847,9 @@ def _show_daily_summary_tab(
 ) -> None:
     st.subheader("📅 Daily Summary")
     st.caption(f"기준일: {rs_full['date'].max().strftime('%Y-%m-%d')} 마감 기준")
+
+    # ── 섹션 0: AI 시장 브리핑 ────────────────────────────────────────────
+    _render_market_briefing()
 
     breadth_today = breadth_df.sort_values("date").iloc[-1] if not breadth_df.empty else pd.Series(dtype=float)
 

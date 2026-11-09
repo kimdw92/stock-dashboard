@@ -1,7 +1,7 @@
 {
   "screener_pct_slider": 80,
-  "screener_3m_rs_pct_min": 85,
-  "screener_1m_rs_pct_min": 75,
+  "screener_3m_rs_pct_min": 90,
+  "screener_1m_rs_pct_min": 70,
   "screener_rs_pct_filter_mode": "AND",
   "screener_slope_chk": false,
   "screener_phase_filter": [

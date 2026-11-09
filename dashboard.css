@@ -286,3 +286,118 @@
   }
 }
 
+/* ─── Market Briefing 컴포넌트 ─────────────────────────────────────────────
+   app.py의 _render_market_briefing()이 생성하는 HTML에 대응하는 스타일.
+   ────────────────────────────────────────────────────────────────────────── */
+
+.briefing-card {
+  background: linear-gradient(135deg, #f8faff 0%, #eef3ff 100%);
+  border: 1px solid #c7d6f0;
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-bottom: 18px;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.06);
+}
+
+.briefing-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #dde6f5;
+}
+
+.briefing-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #1e3a5f;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.briefing-timestamp {
+  font-size: 11px;
+  color: #7b8fa8;
+  font-weight: 500;
+}
+
+.briefing-body {
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: #2c3e50;
+}
+
+.briefing-body ul {
+  margin: 0;
+  padding-left: 4px;
+  list-style: none;
+}
+
+.briefing-body li {
+  margin-bottom: 5px;
+  padding-left: 2px;
+}
+
+/* 헤드라인 목록 (expander 내부) */
+.headline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.headline-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 4px 6px;
+  border-radius: 4px;
+  transition: background 0.12s ease;
+}
+
+.headline-item:hover {
+  background: #f0f4ff;
+}
+
+.headline-source {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  color: #4a6fa5;
+  background: #e8eef8;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.headline-title a {
+  color: #334155;
+  text-decoration: none;
+}
+
+.headline-title a:hover {
+  color: #2563eb;
+  text-decoration: underline;
+}
+
+.headline-time {
+  font-size: 10px;
+  color: #94a3b8;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .briefing-card {
+    background: linear-gradient(135deg, #f8faff 0%, #eef3ff 100%);
+    border-color: #c7d6f0;
+  }
+  .briefing-body { color: #2c3e50; }
+  .headline-title a { color: #334155; }
+}
+

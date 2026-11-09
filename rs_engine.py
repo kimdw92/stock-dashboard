@@ -617,10 +617,18 @@ def build_stock_screener(
     else:
         stocks_df['market_cap'] = np.nan
 
-    # ── Industry enrichment ──────────────────────────────────────────────────
-    if sector_info_df is not None and not sector_info_df.empty and 'industry' in sector_info_df.columns:
-        stocks_df['industry'] = stocks_df['ticker'].map(sector_info_df['industry'])
+    # ── Sector & Industry enrichment ─────────────────────────────────────────
+    if sector_info_df is not None and not sector_info_df.empty:
+        if 'sector' in sector_info_df.columns:
+            stocks_df['sector'] = stocks_df['ticker'].map(sector_info_df['sector'])
+        else:
+            stocks_df['sector'] = np.nan
+        if 'industry' in sector_info_df.columns:
+            stocks_df['industry'] = stocks_df['ticker'].map(sector_info_df['industry'])
+        else:
+            stocks_df['industry'] = np.nan
     else:
+        stocks_df['sector'] = np.nan
         stocks_df['industry'] = np.nan
 
     # ── ETF 보유 종목 역매핑 (enrichment) ────────────────────────────────────
