@@ -58,7 +58,25 @@ _GEMINI_MODELS: list[str] = [
     "gemini-3.5-flash",
     "gemini-3.8-flash",
     "gemini-flash-latest",
+    # 최후 폴백 — 품질은 낮을 수 있으나 과부하가 모델별로 다를 때 요약 공백을 줄인다.
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
 ]
+
+# Gemini 호출 안정화 — 과부하(503/429) 시 무한 대기·즉시 실패를 모두 피한다.
+_GEMINI_TIMEOUT_MS = 45_000                  # 호출 1회당 타임아웃(ms) — 과부하 시 504는 이 시간 뒤에 온다
+_GEMINI_BACKOFF_SEC: tuple[int, ...] = (5, 15)  # lite 모델의 재시도 전 대기(지수 백오프) → 최대 3회
+_GEMINI_TOTAL_BUDGET_SEC = 240               # 한 번의 요약 생성에 쓰는 총 시간 상한
+_GEMINI_RETRY_BUDGET_SEC = 180               # 뉴스 요약 2차(지연) 재시도의 총 시간 상한
+SUMMARY_MAX_AGE_HOURS = 24                   # 이전 요약을 유지·표시하는 최대 경과 시간
+_TRANSIENT_MARKERS = ("503", "429", "500", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED",
+                      "DEADLINE", "TIMEOUT", "TIMED OUT", "OVERLOADED")
+
+# 일반 flash 모델은 과부하일 때 재시도해도 같은 오류가 반복되는 경우가 많아(실측: 'hi' 한 단어도
+# 503/504) 1회만 시도하고 바로 다음 모델로 넘어간다. lite 계열만 백오프 재시도한다.
+def _max_attempts(model_name: str) -> int:
+    return len(_GEMINI_BACKOFF_SEC) + 1 if "lite" in model_name else 1
+
 
 # 브리핑 캐시 유효 시간 — 이 시간 이내에 재실행하면 기존 결과를 재사용한다.
 BRIEFING_CACHE_HOURS = 4
@@ -206,11 +224,25 @@ def _build_prompt(headlines: list[dict[str, str]], market_context: str) -> str:
     return prompt
 
 
-def _summarize_with_gemini(
-    headlines: list[dict[str, str]],
-    market_context: str,
-) -> str | None:
-    """Gemini API로 시장 브리핑을 생성한다. 실패 시 None 반환."""
+def _is_transient_error(e: Exception) -> bool:
+    """재시도할 가치가 있는 일시적 오류(과부하·레이트리밋·타임아웃)인지 판별한다."""
+    code = getattr(e, "code", None)
+    if isinstance(code, int) and code in (429, 500, 503, 504):
+        return True
+    msg = f"{type(e).__name__} {e}".upper()
+    return any(m in msg for m in _TRANSIENT_MARKERS)
+
+
+def _call_gemini(prompt: str, label: str, parse=None, budget_sec: float | None = None):
+    """Gemini를 호출해 결과를 반환한다. 전부 실패하면 None.
+
+    - 호출마다 타임아웃(_GEMINI_TIMEOUT_MS)을 걸어 서버 과부하 시 장시간 매달리지 않는다.
+    - 일반 flash는 1회만 시도하고 실패 시 바로 다음 모델로, lite 계열은 일시적 오류에 한해
+      지수 백오프로 재시도한 뒤 다음 모델로 넘어간다.
+    - 영구 오류(인증·잘못된 모델명 등)는 재시도 없이 다음 모델로 넘어간다.
+    - budget_sec로 총 시간 상한을 호출별로 조정할 수 있다(기본 _GEMINI_TOTAL_BUDGET_SEC).
+    - parse가 주어지면 응답 텍스트를 변환하며, ValueError는 해당 모델 포기로 처리한다.
+    """
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         print("  [Info] GEMINI_API_KEY가 설정되지 않아 LLM 요약을 건너뜁니다.")
@@ -218,27 +250,66 @@ def _summarize_with_gemini(
 
     try:
         from google import genai
-        client = genai.Client(api_key=api_key)
-        prompt = _build_prompt(headlines, market_context)
-
-        for model_name in _GEMINI_MODELS:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                )
-                if response.text and response.text.strip():
-                    print(f"  Gemini 모델 사용 성공: {model_name}")
-                    return response.text.strip()
-            except Exception as e:
-                print(f"  [Warning] {model_name} 호출 실패: {e}")
-                continue
-
-        print("  [Warning] 모든 Gemini 모델 호출이 실패했습니다.")
-        return None
+        from google.genai import types
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=_GEMINI_TIMEOUT_MS),
+        )
     except Exception as e:
-        print(f"  [Warning] Gemini 클라이언트 초기화 실패: {e}")
+        print(f"  [Warning] {label} Gemini 클라이언트 초기화 실패: {e}")
         return None
+
+    budget = _GEMINI_TOTAL_BUDGET_SEC if budget_sec is None else budget_sec
+    deadline = time.time() + budget
+    for model_name in _GEMINI_MODELS:
+        max_attempts = _max_attempts(model_name)
+        for attempt in range(max_attempts):
+            if time.time() >= deadline:
+                print(f"  [Warning] {label} 총 시간 상한({budget:.0f}s) 초과 — 중단합니다.")
+                return None
+            try:
+                response = client.models.generate_content(model=model_name, contents=prompt)
+                text = (response.text or "").strip()
+                if not text:
+                    raise ValueError("빈 응답")
+                result = parse(text) if parse else text
+                print(f"  {label} 생성 성공: {model_name}")
+                return result
+            except ValueError as e:  # 빈 응답·JSON 파싱 실패 (json.JSONDecodeError 포함)
+                print(f"  [Warning] {label} {model_name} 응답 처리 실패: {e}")
+                break
+            except Exception as e:
+                if _is_transient_error(e) and attempt < max_attempts - 1:
+                    wait = _GEMINI_BACKOFF_SEC[attempt]
+                    print(f"  [Warning] {label} {model_name} 일시 오류({attempt + 1}회차), {wait}s 후 재시도: {str(e)[:120]}")
+                    time.sleep(wait)
+                    continue
+                print(f"  [Warning] {label} {model_name} 실패: {str(e)[:200]}")
+                break
+
+    print(f"  [Warning] {label}: 모든 Gemini 모델 호출이 실패했습니다.")
+    return None
+
+
+def _parse_json_response(raw: str) -> dict[str, Any]:
+    """코드블록으로 감싸진 JSON 응답을 파싱한다."""
+    raw = raw.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    elif raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    return json.loads(raw.strip())
+
+
+def _summarize_with_gemini(
+    headlines: list[dict[str, str]],
+    market_context: str,
+    budget_sec: float | None = None,
+) -> str | None:
+    """Gemini API로 시장 브리핑을 생성한다. 실패 시 None 반환."""
+    return _call_gemini(_build_prompt(headlines, market_context), "AI 브리핑", budget_sec=budget_sec)
 
 
 def _summarize_trader_tweets_with_gemini(
@@ -284,38 +355,7 @@ def _summarize_trader_tweets_with_gemini(
 }}
 """
 
-    try:
-        from google import genai
-        client = genai.Client(api_key=api_key)
-
-        for model_name in _GEMINI_MODELS:
-            for attempt in range(2):
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                    )
-                    if response.text and response.text.strip():
-                        raw = response.text.strip()
-                        if raw.startswith("```json"):
-                            raw = raw[7:]
-                        if raw.startswith("```"):
-                            raw = raw[3:]
-                        if raw.endswith("```"):
-                            raw = raw[:-3]
-                        parsed = json.loads(raw.strip())
-                        print(f"  트레이더 브리핑 생성 성공: {model_name}")
-                        return parsed
-                except Exception as e:
-                    if attempt == 0:
-                        time.sleep(2)
-                    else:
-                        print(f"  [Warning] 트레이더 브리핑 {model_name} 실패: {e}")
-                    continue
-    except Exception as e:
-        print(f"  [Warning] Gemini 트레이더 브리핑 클라이언트 오류: {e}")
-
-    return None
+    return _call_gemini(prompt, "트레이더 브리핑", parse=_parse_json_response)
 
 
 def filter_recent_tweets(tweets: list[dict[str, Any]], max_hours: int = 24) -> list[dict[str, Any]]:
@@ -372,12 +412,31 @@ def _is_cache_fresh(force: bool = False) -> bool:
     generated_at = data.get("generated_at", "")
     if not generated_at:
         return False
+    # 요약이 없거나 이전 요약을 대신 보여주는 중이면 신선한 캐시로 보지 않는다 — 재생성을 다시 시도한다.
+    # (API 키가 없으면 어차피 생성할 수 없으므로 매번 재시도하지 않도록 이 조건을 건너뛴다.)
+    if os.environ.get("GEMINI_API_KEY", "").strip() and (
+        not data.get("summary") or data.get("summary_stale")
+    ):
+        return False
     try:
         gen_time = datetime.fromisoformat(generated_at)
         now = datetime.now(timezone.utc)
         return (now - gen_time) < timedelta(hours=BRIEFING_CACHE_HOURS)
     except (ValueError, TypeError):
         return False
+
+
+def _hours_since(iso_str: str | None) -> float | None:
+    """ISO 시각 문자열로부터 경과 시간(시)을 반환한다. 파싱 불가면 None."""
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    except (ValueError, TypeError):
+        return None
 
 
 # ─── 메인 실행 ────────────────────────────────────────────────────────────────
@@ -400,7 +459,7 @@ def generate_briefing(force: bool = False) -> dict[str, Any]:
     try:
         from x_collector import is_session_valid, collect_trader_tweets
         if is_session_valid():
-            collect_trader_tweets(max_tweets_per_trader=2)
+            collect_trader_tweets(max_tweets_per_trader=5)
     except Exception as e:
         print(f"  [Notice] X 트레이더 트윗 수집 건너뜀: {e}")
 
@@ -470,14 +529,39 @@ def generate_briefing(force: bool = False) -> dict[str, Any]:
         except Exception as e:
             print(f"  [Warning] 트레이더 트윗 요약 처리 중 오류: {e}")
 
+    # 뉴스 요약 2차(지연) 재시도 — 과부하는 수 분 뒤 풀리는 경우가 많다.
+    if not summary:
+        print(f"  AI 브리핑 지연 재시도 중 (최대 {_GEMINI_RETRY_BUDGET_SEC}s)...")
+        t3 = time.time()
+        summary = _summarize_with_gemini(headlines, market_context, budget_sec=_GEMINI_RETRY_BUDGET_SEC)
+        if summary:
+            print(f"  AI 브리핑 지연 재시도 성공 ({time.time() - t3:.1f}s)")
+
     # 기존 브리핑의 trader_briefing 보존 (새로 생성되지 않았을 때)
     old_briefing = load_briefing()
     if trader_briefing is None and old_briefing and old_briefing.get("trader_briefing"):
         trader_briefing = old_briefing.get("trader_briefing")
 
+    # 뉴스 요약이 끝내 실패하면 이전 요약을 유지한다 (SUMMARY_MAX_AGE_HOURS 이내일 때만).
+    now_iso = datetime.now(timezone.utc).isoformat()
+    summary_generated_at: str | None = now_iso if summary else None
+    summary_stale = False
+    if not summary and old_briefing and old_briefing.get("summary"):
+        old_at = old_briefing.get("summary_generated_at") or old_briefing.get("generated_at")
+        age_h = _hours_since(old_at)
+        if age_h is not None and age_h <= SUMMARY_MAX_AGE_HOURS:
+            summary = old_briefing["summary"]
+            summary_generated_at = old_at
+            summary_stale = True
+            print(f"  [Info] 새 AI 요약 실패 — {age_h:.1f}시간 전 이전 요약을 유지합니다.")
+        else:
+            print(f"  [Info] 이전 요약이 {SUMMARY_MAX_AGE_HOURS}시간을 초과해 폐기합니다.")
+
     result = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": now_iso,
         "summary": summary,
+        "summary_generated_at": summary_generated_at,
+        "summary_stale": summary_stale,
         "headlines": [
             {
                 "title": h["title"],

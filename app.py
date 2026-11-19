@@ -948,6 +948,26 @@ def _render_market_briefing() -> None:
     # ── 탭 1: 외신 뉴스 브리핑 ────────────────────────────────────────────
     with subtab_news:
         if summary:
+        # 새 AI 요약 생성에 실패해 이전 요약을 유지 중이면 그 사실과 생성 시각을 알린다.
+        # (백엔드가 24시간 초과 요약은 이미 폐기하지만, 방어적으로 한 번 더 거른다.)
+        if summary and briefing.get("summary_stale"):
+            try:
+                from market_briefing import SUMMARY_MAX_AGE_HOURS, _hours_since
+                age_h = _hours_since(briefing.get("summary_generated_at"))
+            except ImportError:
+                SUMMARY_MAX_AGE_HOURS, age_h = 24, None
+            if age_h is None or age_h > SUMMARY_MAX_AGE_HOURS:
+                summary = None
+            else:
+                from datetime import datetime, timezone, timedelta
+                try:
+                    _s_dt = datetime.fromisoformat(briefing["summary_generated_at"]).astimezone(
+                        timezone(timedelta(hours=9)))
+                    _s_label = _s_dt.strftime("%Y-%m-%d %H:%M KST")
+                except (ValueError, TypeError, KeyError):
+                    _s_label = "시각 미상"
+                st.caption(f"⚠️ AI 요약 갱신 실패 — 이전 요약 표시 중 (생성: {_s_label}, {age_h:.0f}시간 전)")
+
             lines = summary.strip().split("\n")
             li_items = []
             for line in lines:
