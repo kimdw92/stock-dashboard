@@ -16,6 +16,7 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import yfinance as yf
 
 # ─── 상수 ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = Path("output")
@@ -947,7 +948,6 @@ def _render_market_briefing() -> None:
 
     # ── 탭 1: 외신 뉴스 브리핑 ────────────────────────────────────────────
     with subtab_news:
-        if summary:
         # 새 AI 요약 생성에 실패해 이전 요약을 유지 중이면 그 사실과 생성 시각을 알린다.
         # (백엔드가 24시간 초과 요약은 이미 폐기하지만, 방어적으로 한 번 더 거른다.)
         if summary and briefing.get("summary_stale"):
@@ -968,6 +968,7 @@ def _render_market_briefing() -> None:
                     _s_label = "시각 미상"
                 st.caption(f"⚠️ AI 요약 갱신 실패 — 이전 요약 표시 중 (생성: {_s_label}, {age_h:.0f}시간 전)")
 
+        if summary:
             lines = summary.strip().split("\n")
             li_items = []
             for line in lines:
@@ -1131,6 +1132,108 @@ def _calc_power_trend(tickers: list[str]) -> dict[str, dict[str, Any]]:
         }
     return result
 
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_intraday_indices(tickers: tuple[str, ...] = ("SPY", "QQQ", "IWM")) -> dict[str, dict[str, Any]]:
+    """당일 5분봉 인트라데이 데이터 및 전일 종가 기준 수익률 시계열 수집.
+
+    Finviz 메인 화면 스타일의 당일 인트라데이 차트 렌더링에 사용되며,
+    Yahoo Finance에서 최근 5일 일봉(전일 종가 확정용) 및 2일 5분봉을 일괄 수집한다.
+    5분 TTL 캐시를 적용하여 불필요한 네트워크 오버헤드를 방지한다.
+    """
+    ticker_list = list(tickers)
+    try:
+        # 1) 전일 종가 산출을 위한 일봉 5일 수집
+        df_day = yf.download(ticker_list, period="5d", interval="1d", progress=False)
+        if df_day.empty or "Close" not in df_day:
+            return {}
+        close_day = df_day["Close"]
+        if len(close_day) < 2:
+            return {}
+        prev_closes = close_day.iloc[-2]
+
+        # 2) 당일 5분봉 수집 (장중 또는 직전 거래일의 5분봉)
+        df_intra = yf.download(ticker_list, period="2d", interval="5m", progress=False)
+        if df_intra.empty or "Close" not in df_intra:
+            return {}
+        close_intra = df_intra["Close"].dropna(how="all")
+        if close_intra.empty:
+            return {}
+
+        latest_date = close_intra.index.date[-1]
+        today_intra = close_intra[close_intra.index.date == latest_date]
+
+        res: dict[str, dict[str, Any]] = {}
+        for t in ticker_list:
+            if t in today_intra.columns and t in prev_closes:
+                s = today_intra[t].dropna()
+                pc = prev_closes[t]
+                if not s.empty and pd.notna(pc) and pc > 0:
+                    ret_series = (s - pc) / pc * 100.0
+                    res[t] = {
+                        "series": ret_series,
+                        "prev_close": float(pc),
+                        "last_price": float(s.iloc[-1]),
+                        "last_pct": float(ret_series.iloc[-1]),
+                    }
+        return res
+    except Exception:
+        return {}
+
+
+def _make_finviz_intraday_chart(ret_series: pd.Series, height: int = 120) -> go.Figure | None:
+    """Finviz 스타일의 경량 당일 인트라데이 스파크라인/에어리어 차트 생성."""
+    if ret_series.empty:
+        return None
+    curr_pct = float(ret_series.iloc[-1])
+    color = "#00c805" if curr_pct >= 0 else "#ff5000"
+    fill_color = "rgba(0, 200, 5, 0.12)" if curr_pct >= 0 else "rgba(255, 80, 0, 0.12)"
+
+    fig = go.Figure()
+    # 0% 기준선 (전일 종가) 점선
+    fig.add_hline(
+        y=0.0,
+        line_dash="dash",
+        line_color="rgba(150, 150, 150, 0.6)",
+        line_width=1,
+    )
+    # 당일 수익률(%) 시계열 곡선
+    fig.add_trace(go.Scatter(
+        x=ret_series.index,
+        y=ret_series.values,
+        mode="lines",
+        line=dict(color=color, width=2),
+        fill="tozeroy",
+        fillcolor=fill_color,
+        hovertemplate="%{x|%H:%M}: %{y:+.2f}%<extra></extra>",
+    ))
+    y_min = min(float(ret_series.min()), 0.0)
+    y_max = max(float(ret_series.max()), 0.0)
+    y_padding = max((y_max - y_min) * 0.15, 0.1)
+
+    fig.update_layout(
+        height=height,
+        margin=dict(t=5, b=20, l=45, r=10),
+        xaxis=dict(
+            showgrid=False,
+            tickformat="%H:%M",
+            tickfont=dict(size=10, color="#888888"),
+            zeroline=False,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(128, 128, 128, 0.2)",
+            ticksuffix="%",
+            tickfont=dict(size=10, color="#888888"),
+            range=[y_min - y_padding, y_max + y_padding],
+            zeroline=False,
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+    return fig
 
 
 def _calc_daily_return(rs_full: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
@@ -4877,52 +4980,55 @@ def _show_daily_summary_tab(
     with st.container():
         st.markdown("#### 📊 오늘의 시장 요약")
 
+        # Finviz 스타일 당일 인트라데이 차트 데이터 로드
+        intraday_data = _fetch_intraday_indices(tuple(MARKET_TICKERS))
         market_ret = _calc_daily_return(rs_full, MARKET_TICKERS)
 
-        col_spy, col_qqq, col_iwm, col_nnh, col_score = st.columns(5)
-        for col, ticker in zip([col_spy, col_qqq, col_iwm], MARKET_TICKERS):
+        # 주요 지수 3개 (SPY, QQQ, IWM) 카드 컬럼: 메트릭 + 미니 인트라데이 차트
+        idx_cols = st.columns(len(MARKET_TICKERS))
+        for col, ticker in zip(idx_cols, MARKET_TICKERS):
             name = MARKET_TICKER_NAMES[ticker]
-            row  = market_ret[market_ret["ticker"] == ticker]
-            pct  = float(row["daily_pct"].values[0]) if not row.empty and pd.notna(row["daily_pct"].values[0]) else 0.0
-            col.metric(
-                label=name,
-                value=f"{pct:+.2f}%",
-                delta=f"{pct:+.2f}%",
-                delta_color="normal" if pct >= 0 else "inverse",
-            )
+            with col:
+                # 1순위: 실시간/당일 인트라데이 데이터, 2순위: rs_full 캐시
+                intra_info = intraday_data.get(ticker)
+                if intra_info:
+                    pct = intra_info["last_pct"]
+                    curr_price = intra_info["last_price"]
+                    val_str = f"${curr_price:.2f}"
+                else:
+                    row = market_ret[market_ret["ticker"] == ticker]
+                    pct = float(row["daily_pct"].values[0]) if not row.empty and pd.notna(row["daily_pct"].values[0]) else 0.0
+                    val_str = f"{pct:+.2f}%"
 
-        nnh   = int(breadth_today.get("net_new_high",  0)) if not breadth_today.empty else 0
+                st.metric(
+                    label=name,
+                    value=val_str,
+                    delta=f"{pct:+.2f}%",
+                    delta_color="normal" if pct >= 0 else "inverse",
+                )
+
+                # Finviz 미니 5분봉 차트 (0% baseline 포함)
+                if intra_info and "series" in intra_info and not intra_info["series"].empty:
+                    fig_intra = _make_finviz_intraday_chart(intra_info["series"], height=115)
+                    if fig_intra:
+                        st.plotly_chart(
+                            fig_intra,
+                            use_container_width=True,
+                            config={"displayModeBar": False, "staticPlot": False},
+                        )
+
+        # 시장 건전성 지표 (Net New High & Breadth Score & Power Trend)
+        st.markdown("##### 🩺 시장 폭 & 트렌드 건전성")
+        b_col1, b_col2, b_col3, b_col4 = st.columns(4)
+
+        nnh = int(breadth_today.get("net_new_high",  0)) if not breadth_today.empty else 0
         score = int(breadth_today.get("breadth_score", 0)) if not breadth_today.empty else 0
         score_label, _ = BREADTH_SCORE_LABELS.get(score, ("N/A", "secondary"))
-        col_nnh.metric("Net New High",   f"{nnh:+d}")
-        col_score.metric("Breadth Score", f"{score}/5 {score_label}")
+        b_col1.metric("Net New High", f"{nnh:+d}")
+        b_col2.metric("Breadth Score", f"{score}/5 {score_label}")
 
-        spy_ret = market_ret[market_ret["ticker"] == "SPY"]["daily_pct"]
-        qqq_ret = market_ret[market_ret["ticker"] == "QQQ"]["daily_pct"]
-        iwm_ret = market_ret[market_ret["ticker"] == "IWM"]["daily_pct"]
-        spy_pct = float(spy_ret.values[0]) if not spy_ret.empty and pd.notna(spy_ret.values[0]) else 0.0
-        qqq_pct = float(qqq_ret.values[0]) if not qqq_ret.empty and pd.notna(qqq_ret.values[0]) else 0.0
-        iwm_pct = float(iwm_ret.values[0]) if not iwm_ret.empty and pd.notna(iwm_ret.values[0]) else 0.0
-
-        char_df = pd.DataFrame({
-            "ticker":    ["SPY", "QQQ", "IWM"],
-            "daily_pct": [spy_pct, qqq_pct, iwm_pct],
-        })
-        char_text, char_color = _get_market_character(char_df, breadth_today)
-
-        if char_color == "success":
-            st.success(char_text)
-        elif char_color == "warning":
-            st.warning(char_text)
-        elif char_color == "danger":
-            st.error(char_text)
-        else:
-            st.info(char_text)
-
-        # Power Trend 판정 (Price > 21 EMA > 50 SMA)
         power_trends = _calc_power_trend(["SPY", "QQQ"])
-        pt_cols = st.columns(2)
-        for pt_col, ticker in zip(pt_cols, ["SPY", "QQQ"]):
+        for pt_col, ticker in zip([b_col3, b_col4], ["SPY", "QQQ"]):
             pt_data = power_trends.get(ticker, {})
             pt_val = pt_data.get("is_power_trend")
             price = pt_data.get("price")
@@ -4945,6 +5051,37 @@ def _show_daily_summary_tab(
                 value=f"{pt_icon} {pt_label}",
                 help=help_txt,
             )
+
+        # 시장 성격 진단 배너
+        spy_pct = intraday_data.get("SPY", {}).get("last_pct")
+        if spy_pct is None:
+            spy_ret = market_ret[market_ret["ticker"] == "SPY"]["daily_pct"]
+            spy_pct = float(spy_ret.values[0]) if not spy_ret.empty and pd.notna(spy_ret.values[0]) else 0.0
+
+        qqq_pct = intraday_data.get("QQQ", {}).get("last_pct")
+        if qqq_pct is None:
+            qqq_ret = market_ret[market_ret["ticker"] == "QQQ"]["daily_pct"]
+            qqq_pct = float(qqq_ret.values[0]) if not qqq_ret.empty and pd.notna(qqq_ret.values[0]) else 0.0
+
+        iwm_pct = intraday_data.get("IWM", {}).get("last_pct")
+        if iwm_pct is None:
+            iwm_ret = market_ret[market_ret["ticker"] == "IWM"]["daily_pct"]
+            iwm_pct = float(iwm_ret.values[0]) if not iwm_ret.empty and pd.notna(iwm_ret.values[0]) else 0.0
+
+        char_df = pd.DataFrame({
+            "ticker":    ["SPY", "QQQ", "IWM"],
+            "daily_pct": [spy_pct, qqq_pct, iwm_pct],
+        })
+        char_text, char_color = _get_market_character(char_df, breadth_today)
+
+        if char_color == "success":
+            st.success(char_text)
+        elif char_color == "warning":
+            st.warning(char_text)
+        elif char_color == "danger":
+            st.error(char_text)
+        else:
+            st.info(char_text)
 
     st.divider()
 
@@ -4975,7 +5112,7 @@ def _show_daily_summary_tab(
 
 # ─── 메인 ─────────────────────────────────────────────────────────────────────
 def main() -> None:
-    st.set_page_config(page_title="RS Dashboard", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="Superstock Terminal", page_icon="🚀", layout="wide")
     _inject_dashboard_css()
 
     sector_summary  = load_sector_summary()
@@ -4989,7 +5126,7 @@ def main() -> None:
 
     render_sidebar(rs_full)
 
-    st.title("📊 RS Dashboard")
+    st.title("🚀 Superstock Terminal")
 
     tab1, tab2, tab3, tab_ind, tab4, tab5, tab6, tab7 = st.tabs([
         "📅 Daily Summary",
