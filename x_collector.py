@@ -225,9 +225,7 @@ def _extract_tweet_from_result(result_obj: dict[str, Any], handle: str) -> dict[
     if not isinstance(legacy, dict):
         return None
 
-    # 1. 리트윗(Retweet) 필터링: 타인의 글 재게시는 제외
-    if legacy.get("retweeted_status_result") or legacy.get("retweeted_status_id_str"):
-        return None
+    # 1. 리트윗(Retweet) 허용 (필터링하지 않고 수집)
 
     # 2. 타인에게 보낸 답글(Reply) 필터링: 원문 브로드캐스트 글만 수집
     in_reply_to_user = legacy.get("in_reply_to_screen_name")
@@ -262,7 +260,7 @@ def _extract_tweet_from_result(result_obj: dict[str, Any], handle: str) -> dict[
     }
 
 
-def parse_graphql_timeline(data: dict[str, Any], handle: str, max_count: int = 2) -> list[dict[str, Any]]:
+def parse_graphql_timeline(data: dict[str, Any], handle: str, max_count: int = 5) -> list[dict[str, Any]]:
     """X 프론트엔드의 UserTweets/UserTimeline GraphQL 응답 JSON을 파싱하여 정제된 트윗 목록을 반환한다."""
     tweets: list[dict[str, Any]] = []
     if not isinstance(data, dict):
@@ -382,13 +380,7 @@ def _parse_tweet_article(article: Any, handle: str) -> dict[str, Any] | None:
         for l in lines[:3]
     )
 
-    # [피드백 반영 2] 리트윗(Retweet) 필터링: 타인 글 재게시는 제외
-    is_retweet = any(
-        kw in l for kw in ["재게시", "reposted", "Reposted", "님이 재게시했습니다"]
-        for l in lines[:2]
-    )
-    if is_retweet:
-        return None
+    # [수정] 리트윗(Retweet) 허용 (필터링하지 않고 수집)
 
     # [피드백 반영 3] 단순 답글(Reply) 필터링: 본문 브로드캐스트 글만 수집
     is_reply = any(
@@ -448,7 +440,7 @@ def _parse_tweet_article(article: Any, handle: str) -> dict[str, Any] | None:
 
 
 def collect_trader_tweets(
-    max_tweets_per_trader: int = 2,
+    max_tweets_per_trader: int = 5,
     max_age_hours: int | None = None,
     force: bool = False,
 ) -> list[dict[str, Any]]:
@@ -650,7 +642,7 @@ if __name__ == "__main__":
     parser.add_argument("--login", action="store_true", help="브라우저 창을 열어 로그인 세션 저장")
     parser.add_argument("--cookie", type=str, default="", help="브라우저 개발자 도구의 auth_token 쿠키 값 직접 입력")
     parser.add_argument("--ct0", type=str, default="", help="브라우저 개발자 도구의 ct0 쿠키 값 (선택)")
-    parser.add_argument("--count", type=int, default=2, help="트레이더당 수집할 최대 트윗 수")
+    parser.add_argument("--count", type=int, default=5, help="트레이더당 수집할 최대 트윗 수")
     parser.add_argument("--hours", type=int, default=None, help="현재 시점 기준 수집할 최대 경과 시간 (예: 24)")
     parser.add_argument("--force", action="store_true", help="캐시 무시 강제 수집")
     args = parser.parse_args()
