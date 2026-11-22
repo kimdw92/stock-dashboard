@@ -3948,6 +3948,59 @@ def _show_breadth_tab(breadth_df: pd.DataFrame) -> None:
 
     st.divider()
 
+    # 섹션 B-2: 이동평균 구조별 종목 수 (Leading / Mediocre / Lagging)
+    with st.container():
+        st.markdown("#### 이동평균 구조별 종목 수 (Leading / Mediocre / Lagging)")
+
+        stack_cols = ["leading_count", "mediocre_count", "lagging_count"]
+        if not all(c in df.columns for c in stack_cols):
+            st.info("Leading/Lagging 분류 데이터가 없습니다. rs_engine.py를 다시 실행하세요.")
+        else:
+            st.caption(
+                "Leading: 주가 > 50 SMA > 200 SMA · "
+                "Lagging: 주가 < 50 SMA < 200 SMA · "
+                "Mediocre: 그 외(두 이평선 사이에 얽힌 상태). 200일 미만 상장 종목은 제외."
+            )
+
+            def _stack_metric(col, label: str, key: str) -> None:
+                cur = int(latest[key])
+                total = int(latest[stack_cols].sum())
+                pct = cur / total * 100 if total else 0.0
+                delta_txt = None
+                if len(df) >= 2 and pd.notna(df[key].iloc[-2]):
+                    delta_txt = f"{cur - int(df[key].iloc[-2]):+,}개 (전일 대비)"
+                col.metric(label, f"{cur:,}개 ({pct:.1f}%)", delta=delta_txt, delta_color="off")
+
+            m1, m2, m3 = st.columns(3)
+            _stack_metric(m1, "Leading",  "leading_count")
+            _stack_metric(m2, "Mediocre", "mediocre_count")
+            _stack_metric(m3, "Lagging",  "lagging_count")
+
+            fig_stack = go.Figure()
+            for col_name, label, color in [
+                ("leading_count",  "Leading",  "#1D9E75"),
+                ("mediocre_count", "Mediocre", "#EF9F27"),
+                ("lagging_count",  "Lagging",  "#E24B4A"),
+            ]:
+                fig_stack.add_trace(go.Scatter(
+                    x=df["date"], y=df[col_name],
+                    name=label,
+                    stackgroup="one",
+                    line=dict(color=color, width=0.8),
+                    hovertemplate=f"{label}: %{{y:,}}개",
+                ))
+            fig_stack.update_layout(
+                height=320,
+                margin=dict(t=10, b=40, l=0, r=0),
+                legend=dict(orientation="h", y=-0.2),
+                hovermode="x unified",
+                yaxis=dict(title="종목 수"),
+            )
+            fig_stack.update_xaxes(rangebreaks=rangebreaks)
+            st.plotly_chart(fig_stack, width='stretch')
+
+    st.divider()
+
     # 섹션 C: A/D Line
     with st.container():
         st.markdown("#### Advance / Decline Line")
@@ -5051,6 +5104,20 @@ def _show_daily_summary_tab(
                 value=f"{pt_icon} {pt_label}",
                 help=help_txt,
             )
+
+        # 이동평균 구조별 종목 수 (Leading / Mediocre / Lagging)
+        stack_keys = ["leading_count", "mediocre_count", "lagging_count"]
+        if not breadth_today.empty and all(k in breadth_today.index for k in stack_keys):
+            stack_total = sum(int(breadth_today[k]) for k in stack_keys)
+            s_cols = st.columns(3)
+            for s_col, key, label, help_txt in zip(
+                s_cols, stack_keys,
+                ["Leading", "Mediocre", "Lagging"],
+                ["주가 > 50 SMA > 200 SMA", "Leading/Lagging 어느 쪽도 아닌 종목", "주가 < 50 SMA < 200 SMA"],
+            ):
+                cnt = int(breadth_today[key])
+                pct = cnt / stack_total * 100 if stack_total else 0.0
+                s_col.metric(f"{label} 종목", f"{cnt:,}개 ({pct:.1f}%)", help=help_txt)
 
         # 시장 성격 진단 배너
         spy_pct = intraday_data.get("SPY", {}).get("last_pct")

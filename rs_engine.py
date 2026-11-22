@@ -751,12 +751,28 @@ def build_breadth_metrics(
     # 분모를 p.notna()가 아닌 ma.notna()로 산정
     # → 가격은 있지만 MA 산출 이력이 부족한 신규 상장 종목을 분모에서 제외
     # → p > ma: ma가 NaN이면 비교 결과 False → above 자동 제외
+    mas: Dict[int, pd.DataFrame] = {}
     for window in ma_windows:
         logger.info(f"{window}일 이동평균 위 종목 비율 계산 중...")
         ma    = p.rolling(window, min_periods=window).mean()
+        mas[window] = ma
         above = (p > ma).sum(axis=1)
         total = ma.notna().sum(axis=1).replace(0, np.nan)   # 유효 MA 보유 종목만 분모
         result[f"pct_above_{window}ma"] = (above / total * 100).round(1)
+
+    # ── 2-B. 이동평균 구조별 종목 수 (Leading / Mediocre / Lagging) ───────────
+    # Leading: 주가 > 50SMA > 200SMA, Lagging: 주가 < 50SMA < 200SMA, 나머지는 Mediocre.
+    # SMA200 산출 불가(상장 200일 미만) 또는 주가 NaN인 종목은 분류에서 제외
+    # → 세 카테고리의 합 = 그날의 유효 종목 수 (pct_above_200ma 분모와 동일)
+    if 50 in mas and 200 in mas:
+        logger.info("Leading/Mediocre/Lagging 분류 계산 중...")
+        sma50, sma200 = mas[50], mas[200]
+        valid   = sma50.notna() & sma200.notna() & p.notna()
+        leading = valid & (p > sma50) & (sma50 > sma200)
+        lagging = valid & (p < sma50) & (sma50 < sma200)
+        result["leading_count"]  = leading.sum(axis=1)
+        result["lagging_count"]  = lagging.sum(axis=1)
+        result["mediocre_count"] = valid.sum(axis=1) - result["leading_count"] - result["lagging_count"]
 
     # ── 3. Advance / Decline Line ─────────────────────────────────────────────
     # diff() 결과 NaN(첫날·데이터 공백): > 0 / < 0 모두 False → 집계 자동 제외
